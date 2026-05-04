@@ -1,0 +1,3050 @@
+---
+title: "Investigating Predictors of Serious Drug Reactions from the FDA Adverse Drug Events Report"
+author:
+- Suzanna Semaan
+- Olivia Yang
+- Kruthi Muralidhara Jety
+date: 'May 1, 2026'
+output:
+  html_document:
+    code_folding: show
+    highlight: haddock
+    number_sections: yes
+    theme: lumen
+    toc: yes
+    toc_depth: 4
+    toc_float: yes
+    pandoc_args: ["--to", "html5"]
+  pdf_document:
+    extra_dependencies: ["dcolumn"]
+    number_sections: yes
+    toc: yes
+    toc_depth: '4'
+  word_document:
+    toc: yes
+    toc_depth: '4'
+urlcolor: blue
+---
+
+---
+
+```{r Setup, include=FALSE, results='hide', warning=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,  # Hide code by default
+  warning = FALSE,
+  message = FALSE,
+  results = FALSE,
+  fig.width = 11,
+  fig.height = 7,
+  fig.align = 'center'
+)
+options(scipen = 0, digits = 3)  # controls base R output
+options(repos = c(CRAN = "https://cloud.r-project.org/"))
+
+# Package setup
+if(!require("pacman")) install.packages("pacman")
+
+pacman::p_load(tidyverse, dplyr, ggplot2, ggthemes, data.table, lubridate,glmnet,GGally, RColorBrewer, ggsci, plotROC, usmap, plotly, ggpubr, vistime, coefplot, sf, tigris, lmtest, car, viridis, scales, knitr, kableExtra,caret, keras, skimr, MASS, randomForest, tree, rpart, party, xgboost, Matrix, forcats, data.table, DiagrammeR, pROC, ggridges, caret, gridExtra, keras3)
+select <- dplyr::select
+filter <- dplyr::filter
+recode <- dplyr::recode
+summarise <- dplyr::summarise
+mutate <- dplyr::mutate
+arrange <- dplyr::arrange
+count <- dplyr::count
+slice <- dplyr::slice
+rename <- dplyr::rename
+pull <- dplyr::pull
+```
+
+## Abstract
+
+We seek to understand what factors can be used to predict serious drug outcomes. The data set we use is a collection of drug safety reports submitted by healthcare professionals, manufacturers, and patients to the FDA Adverse Event Reporting System (FAERS), containing 528,000 reports between January 2015 and December 2025. We will first investigate what demographic factors pre-dispose patients to having negative reactions to medications and the degree of the severity. Then, we will look at drug classes, manufacturing companies, and age of the drug as predictive factors. We begin with EDA to gauge general trends, then we will use logistic regression with LASSO to determine the most significant predictors for a serious disease outcome. We proceed with relaxed logistic LASSO to get error estimates for the LASSO model. We also fit neural network-based models and an extreme gradient boosting model (XGBoost) to better capture nuanced relationships in the data and to robustly handle missing information. Finally, a model comparison will be performed to gauge the best method for predicting serious drug outcomes. 
+
+## Introduction
+
+Serious reactions to prescribed medications are a threat to public health; though drugs are rigorously tested before approval, serious reactions, such a hospitalization or death, do happen. Understanding precisely what factors are most likely to cause a serious drug outcome can help researchers and manufacturers with prevention efforts. This project aims to create an accurate model for classifying drug reactions as serious or not serious by comparing three different approaches: penalized logistic regression, neural networks, and extreme gradient boosting. Our motivating question is: given information about a patient and a drug, can we predict whether there the patient will have a serious reaction to the drug?
+
+### Data Description
+
+The data set we use is a collection of drug safety reports submitted by healthcare professionals, manufacturers, and patients to the FDA Adverse Event Reporting System (FAERS), containing 528,000 reports between January 2015 and December 2025. Each row corresponds to a single report associated with a suspected medication. The data set contains 30 columns detailing patient demographics (age, sex, weight, number of drugs taken), drug information (drug name, purpose, manufacturer, FDA pharmacological drug class, and administration route), report details (month, year, received date, and country), and reaction details (recovery, primary reaction, all reactions, reaction outcomes, whether the reaction was serious/fatal/life-threatening/disabling/required hospitalization). The data is rich with a mix of character strings, binary encoding variables, and numeric data, with missing data often recorded as 'Unknown' in factor/character columns.
+
+#### Data Processing
+
+Though the data was pre-processed, we converted the receive date to a dateTime type, converted binary variables to factors, and replaced any entry with 'Unknown' with NAs. This cleaning decision made it easy to remove NAs when needed and to use missing information as informative when performing neural network and XGBoosted analyses. We also converted character columns such as 'brand_name,' 'reactions,' 'primary_reaction,' 'pharm_class,' 'suspect_drug,' 'drug_indication', and 'country' to factors, lumping less common levels into ~50 unique levels to reduce the impact of 'rare but deadly' medications or manufacturers on results. 
+
+We will use a subset of the data that contains no NAs (around 39k rows) for logistic regression while we use the full original dataset (around 528k rows) for the boosted model. This is because logistic regression and associated methods (logistic LASSO and relaxed logistic LASSO) cannot handle blank entries, whereas the boosted model internally uses missing-ness as a form of information. For the neural network models, selective data cleaning was performed: rows missing patient_age_years were removed as age was an important predictor in the model, median imputation was performed for patient_weight_kg to give better summary statistics.
+
+To prepare categorical data for XGBoost and neural network models, we use **one-hot encoding**, which assigns numerical values to categorical variables. Since our data has high-cardinality predictors that have been lumped, we use a **sparse encoding matrix** to reduce memory usage.
+
+```{r preprocessing}
+
+data <- fread("fda_adverse_events_2015_2026_CLEAN.csv")
+# head(data)
+```
+
+##### Missing Data
+
+Patient age (n = 151,509) and weight (n = 379,923) are often missing and no other columns have blank entries. The mean number of reactions experienced by a patient is 0.628, while the average number of drugs a patient is taking at a given time is 0.87. Data can also be missing with entry "Unknown": below, we show how much data is actually unknown.
+
+```{r unknown}
+# check unknowns
+unknown_counts_long <- data %>%
+  dplyr::select(-receive_date) %>%
+  summarise(across(everything(), ~ sum(. == "Unknown", na.rm = TRUE))) %>%
+  pivot_longer(cols = everything(),
+               names_to = "column",
+               values_to = "unknown_count") %>%
+  arrange(desc(unknown_count)) %>%
+  filter(unknown_count > 0)
+```
+
+```{r, results = TRUE}
+knitr::kable(unknown_counts_long, 
+             caption = 'Count of Unknown Entries, by Column (Zero not shown)',
+col.names = c("Column Name", "Count"))%>% kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+```
+
+All columns are missing at least some information; the most common missing information is the **class of the pharmaceutical and reaction outcome**. This makes sense: the FDA pharmacological drug class might not be known by patients self-reporting their symptoms, while the reaction outcome might not be known by physicians filling out the form on behalf of their patients.
+
+```{r data processing}
+
+length(unique(data$suspect_drug)) # 9828 unique drugs
+length(unique(data$manufacturer)) # 1570 manufacturers (some are combined)
+
+# change dates to a date
+data$receive_date <- ymd(data$receive_date)
+
+# change binary outcomes to factors
+data$serious <- as.factor(data$serious)
+data$is_fatal          <- as.logical(data$is_fatal)
+data$is_hospitalized   <- as.logical(data$is_hospitalized)
+data$is_disabling      <- as.logical(data$is_disabling)
+data$is_life_threat    <- as.logical(data$is_life_threat)
+data$patient_recovered <- as.logical(data$patient_recovered)
+
+
+data$age_group <- factor(data$age_group, levels = c("Infant(0-2)", "Child(3-12)", "Teen(13-18)", "Adult(19-40)", "Middle-Aged(41-65)", "Senior(66-80)", "Elderly(81+)", "Unknown" ))
+data$patient_sex <- as.factor(data$patient_sex)
+
+# str(data)
+```
+
+```{r data cleaning}
+
+# change other characters to factors
+# so we can use brand, country, etc as predictors
+data$drug_indication <- as.factor(data$drug_indication)
+data$brand_name <- as.factor(data$brand_name)
+data$reaction_outcomes <- as.factor(data$reaction_outcomes)
+data$suspect_drug <- as.factor(data$suspect_drug)
+data$pharm_class <- as.factor(data$pharm_class)
+data$country <- as.factor(data$country)
+data$drug_count_category <- factor(data$drug_count_category,
+  levels = c("Single", "2-3 Drugs", "4-5 Drugs", "Polypharmacy(6+)", "Unknown"))
+
+# transmission method
+route_labels <- c(
+  "48.0" = "Oral",             "65.0" = "Subcutaneous",
+  "58.0" = "Intravenous",      "42.0" = "Intramuscular",
+  "41.0" = "Intraperitoneal",  "50.0" = "Ophthalmic",
+  "30.0" = "Cutaneous/Dermal", "64.0" = "Transdermal",
+  "55.0" = "Rectal",           "61.0" = "Sublingual",
+  "62.0" = "Inhalation",       "15.0" = "Auricular (Otic)",
+  "47.0" = "Nasal",            "37.0" = "Intrathecal",
+  "33.0" = "Epidural",         "31.0" = "Intravitreal",
+  "67.0" = "Vaginal",          "59.0" = "Intradermal",
+  "40.0" = "Intraarticular"
+)
+
+data$drug_route_label <- dplyr::recode(data$drug_route, !!!route_labels)
+data$drug_route_label[data$drug_route == "Unknown"] <- "Unknown"
+
+age_order_known <- c("Infant(0-2)", "Child(3-12)", "Teen(13-18)",
+                     "Adult(19-40)", "Middle-Aged(41-65)",
+                     "Senior(66-80)", "Elderly(81+)")
+
+```
+
+
+```{r}
+length(unique(data$drug_indication))
+length(unique(data$brand_name))
+```
+
+### Exploratory Data Analysis
+
+#### Overview of Outcome Severity
+
+Of the 528,000 reports in the FAERS dataset, nearly three in four (74.8%, n = 395,000) were classified as involving a **serious** adverse reaction. That proportion is higher than one might expect, but it reflects a key feature of how FAERS works: reports are most often filed by healthcare professionals and manufacturers when outcomes are concerning, so the dataset is naturally skewed toward more severe events. The table below shows how serious outcomes break down into their component flags.
+
+```{r outcome-table}
+data.frame(
+  Outcome   = c("Serious (any)", "Hospitalized", "Fatal",
+                "Life-Threatening", "Disabling", "Recovered"),
+  Count     = c(
+    sum(data$serious == "Yes"),
+    sum(data$is_hospitalized),
+    sum(data$is_fatal),
+    sum(data$is_life_threat),
+    sum(data$is_disabling),
+    sum(data$patient_recovered)
+  )
+) %>%
+  mutate(Proportion = Count / nrow(data)) %>%
+  knitr::kable(
+    digits  = 3,
+    col.names = c("Outcome", "Count", "Proportion of All Reports"),
+    caption = "Frequency of serious outcome flags across 528,000 FAERS reports"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>%
+  kableExtra::row_spec(1, bold = TRUE, background = "#FFF3CD")
+```
+
+```{r outcome-stacked, fig.height = 4.5}
+sev_df <- data.frame(
+  Category = c("Fatal", "Life-Threatening", "Disabling",
+               "Hospitalized Only", "Non-Serious"),
+  Count = c(
+    sum(data$is_fatal),
+    sum(data$is_life_threat  & !data$is_fatal),
+    sum(data$is_disabling    & !data$is_fatal & !data$is_life_threat),
+    sum(data$is_hospitalized & !data$is_fatal & !data$is_life_threat & !data$is_disabling),
+    sum(data$serious == "No")
+  )
+) %>%
+  mutate(
+    Proportion = Count / nrow(data),
+    Category   = factor(Category,
+                        levels = c("Non-Serious", "Hospitalized Only",
+                                   "Disabling", "Life-Threatening", "Fatal"))
+  )
+
+ggplot(sev_df, aes(x = Proportion, y = "All Reports", fill = Category)) +
+  geom_col(position = "stack", width = 0.55) +
+  geom_text(
+    aes(label = ifelse(Proportion > 0.022,
+                       paste0(percent(Proportion, accuracy = 0.1),
+                              "\n(", comma(Count), ")"), "")),
+    position  = position_stack(vjust = 0.5),
+    color     = "white", fontface = "bold", size = 3.8, lineheight = 1.1
+  ) +
+  scale_fill_manual(values = c(
+    "Non-Serious"       = "#90A4AE",
+    "Hospitalized Only" = "#42A5F5",
+    "Disabling"         = "#FFA726",
+    "Life-Threatening"  = "#EF5350",
+    "Fatal"             = "#4A148C"
+  )) +
+  scale_x_continuous(labels = percent, expand = c(0, 0)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(color = "grey40", size = 11),
+    axis.text.y     = element_blank(),
+    axis.ticks.y    = element_blank(),
+    panel.grid      = element_blank(),
+    legend.position = "bottom",
+    legend.title    = element_blank()
+  ) +
+  labs(
+    x        = "Proportion of All 528,000 Reports",
+    y        = NULL,
+    title    = "How Severe Are the Adverse Events in This Dataset?",
+    subtitle = "Each report is placed in its highest-severity tier only"
+  )
+```
+
+Hospitalization is by far the most common serious outcome — over a third of all reports (35.6%, n = 188,042) involved a patient being admitted to hospital. Fatal outcomes account for 10.3% of all reports (n = 54,301), life-threatening reactions for 4.3%, and permanent disability for 2.6%. Only 23.4% of patients were recorded as having recovered, which underscores how poorly outcomes are documented in adverse event reporting systems.
+
+#### Demographic Predictors
+
+Analysis of Age and Weight may be found in the Appendix. We proceed with an analysis of sex.
+
+##### Sex
+
+```{r sex-outcome-grouped, fig.height = 5.5}
+data %>%
+  filter(patient_sex %in% c("Female", "Male")) %>%
+  group_by(patient_sex) %>%
+  summarise(
+    Fatal              = mean(is_fatal),
+    Hospitalized       = mean(is_hospitalized),
+    `Life-Threatening` = mean(is_life_threat),
+    Disabling          = mean(is_disabling)
+  ) %>%
+  pivot_longer(-patient_sex, names_to = "Outcome", values_to = "Rate") %>%
+  mutate(Outcome = factor(Outcome,
+                          levels = c("Hospitalized", "Fatal",
+                                     "Life-Threatening", "Disabling"))) %>%
+  ggplot(aes(x = Outcome, y = Rate, fill = patient_sex)) +
+  geom_col(position = "dodge", width = 0.6) +
+  geom_text(
+    aes(label = percent(Rate, accuracy = 0.1)),
+    position = position_dodge(width = 0.6),
+    vjust = -0.4, size = 3.8
+  ) +
+  scale_fill_manual(values = c("Female" = "#4DBBD5", "Male" = "#E64B35"),
+                    name = NULL) +
+  scale_y_continuous(labels = percent, limits = c(0, 0.50),
+                     expand = c(0, 0)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(color = "grey40", size = 11),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x        = "Outcome Type",
+    y        = "Rate Within Sex Group",
+    title    = "Male Patients Experience Markedly Worse Outcomes",
+    subtitle = "Fatal and hospitalization rates are substantially higher for male patients"
+  )
+```
+
+There is a meaningful sex difference in outcome severity. Male patients have a fatality rate of 13.5% compared to 7.9% for females — a **71% relative increase** in risk of death. Hospitalization rates also diverge (39.6% vs 34.3%). These differences could reflect several overlapping factors: males may be reporting on drugs for more severe underlying conditions, there may be sex-based pharmacokinetic differences affecting drug metabolism, or there may be a reporting pattern where male patients present later and with more advanced illness. Disability rates (2.7% vs 2.6%) are nearly identical between sexes, suggesting that once a reaction becomes serious, the long-term functional impact is similar.
+
+##### Age × Sex Interaction
+
+```{r age-sex-heatmap, fig.height = 4.5}
+data %>%
+  filter(age_group %in% age_order_known,
+         patient_sex %in% c("Female", "Male")) %>%
+  group_by(age_group, patient_sex) %>%
+  summarise(serious_rate = mean(serious == "Yes"), .groups = "drop") %>%
+  mutate(age_group = factor(age_group, levels = age_order_known)) %>%
+  ggplot(aes(x = age_group, y = patient_sex, fill = serious_rate)) +
+  geom_tile(color = "white", linewidth = 1.2) +
+  geom_text(aes(label = percent(serious_rate, accuracy = 0.1)),
+            size = 5, fontface = "bold", color = "white") +
+  scale_fill_viridis_c(option = "D", labels = percent,
+                       name = "Serious\nRate",
+                       limits = c(0.62, 0.92)) +
+  scale_x_discrete(expand = c(0, 0)) +
+  scale_y_discrete(expand = c(0, 0)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    axis.text.x   = element_text(angle = 30, hjust = 1),
+    panel.grid    = element_blank()
+  ) +
+  labs(
+    x        = "Age Group",
+    y        = NULL,
+    title    = "Where the Sex Gap Is Largest — and Where It Reverses",
+    subtitle = "Serious reaction rate by age group and sex"
+  )
+```
+
+Looking at the age-sex interaction reveals two distinct patterns. In **adults and older patients**, the male excess in serious outcomes is consistent and grows with age — the gap reaches 10 percentage points in middle-aged adults (84.5% male vs 74.3% female) and widens further in senior patients (85.1% vs 74.4%). This may reflect age-related differences in drug metabolism, comorbidity burden, or polypharmacy patterns. The striking exception is **children (3–12)**, where females have a *higher* serious reaction rate than males (74.6% vs 63.6%). This reversal, while based on relatively small group sizes (n = 9,767), is consistent with known differences in paediatric drug pharmacology and warrants further investigation.
+
+### Drug-Level Predictors
+
+#### Pharmaceutical Drug Class
+
+What drug a patient is taking is arguably the strongest single predictor of outcome severity. The lollipop chart below encodes both the number of reports (point size) and the serious reaction rate for the 15 most-reported drug classes simultaneously — this matters because a high rate in a rarely-reported class could easily be a statistical artefact.
+
+```{r pharm-class-lollipop, fig.height = 7.5}
+data %>%
+  filter(pharm_class != "Unknown") %>%
+  group_by(pharm_class) %>%
+  summarise(n = n(), serious_rate = mean(serious == "Yes")) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 15) %>%
+  mutate(
+    pharm_class_clean = str_remove(pharm_class, " \\[EPC\\]$"),
+    pharm_class_clean = fct_reorder(pharm_class_clean, serious_rate)
+  ) %>%
+  ggplot(aes(x = pharm_class_clean, y = serious_rate)) +
+  geom_segment(aes(xend = pharm_class_clean, y = 0.15, yend = serious_rate),
+               color = "grey80", linewidth = 0.8) +
+  geom_point(aes(size = n, color = serious_rate)) +
+  geom_text(aes(label = percent(serious_rate, accuracy = 0.1)),
+            hjust = -0.5, size = 3.4, color = "grey20") +
+  coord_flip() +
+  scale_color_viridis_c(option = "D", begin = 0.05, end = 0.92,
+                        labels = percent, name = "Serious\nRate") +
+  scale_size_continuous(range = c(3, 13), name = "Reports",
+                        labels = comma) +
+  scale_y_continuous(labels = percent, limits = c(0.1, 1.18),
+                     expand = c(0, 0)) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(color = "grey40", size = 11),
+    axis.text.y     = element_text(size = 10.5),
+    panel.grid.major.y = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x        = NULL,
+    y        = "Serious Reaction Rate",
+    title    = "Drug Class Drives Enormous Variation in Outcome Severity",
+    subtitle = "Top 15 most-reported drug classes; point size proportional to report volume"
+  )
+```
+
+The range across drug classes — from 17.9% to 98.3% — is striking. **Factor Xa Inhibitors** (anticoagulants like rivaroxaban) top the list at 98.3% across 13,839 reports, and **PD-1 checkpoint inhibitors** (cancer immunotherapies like nivolumab and pembrolizumab) are nearly as high at 98.0% across 7,895 reports. These are not small groups, which rules out sampling noise. Anticoagulants generate serious reports almost universally because the adverse events that get documented — bleeds, haemorrhages, strokes — are inherently serious; mild anticoagulant-related symptoms rarely reach the reporting threshold. At the other end, **Interleukin-4 receptor alpha Antagonists** (primarily dupilumab, used for eczema and asthma) have the lowest rate at 17.9%, reflecting that most reactions to dupilumab are injection-site irritations or minor conjunctivitis. **Atypical Antipsychotics** similarly sit at 43.4% because many of their documented reactions — weight gain, sedation, akathisia — fall below the serious threshold. Drug class is very likely to be one of the most important predictors in our LASSO model.
+
+#### Route of Administration
+
+```{r drug-route-dot, fig.height = 6.5}
+data %>%
+  filter(drug_route_label != "Unknown") %>%
+  group_by(drug_route_label) %>%
+  summarise(n = n(), serious_rate = mean(serious == "Yes")) %>%
+  arrange(desc(n)) %>%
+  slice_head(n = 12) %>%
+  mutate(drug_route_label = fct_reorder(drug_route_label, serious_rate)) %>%
+  ggplot(aes(x = serious_rate, y = drug_route_label, color = serious_rate)) +
+  geom_segment(aes(x = 0.38, xend = serious_rate, yend = drug_route_label),
+               color = "grey80", linewidth = 0.7) +
+  geom_point(aes(size = n), alpha = 0.9) +
+  geom_text(aes(label = paste0(percent(serious_rate, accuracy = 0.1),
+                               "  (n=", comma(n), ")")),
+            nudge_x = 0.032, size = 3.3, color = "grey20") +
+  scale_color_viridis_c(option = "C", begin = 0.1, end = 0.92,
+                        labels = percent, name = "Serious\nRate") +
+  scale_size_continuous(range = c(3, 15), name = "Reports",
+                        labels = comma) +
+  scale_x_continuous(labels = percent, limits = c(0.35, 1.15),
+                     expand = c(0, 0)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(color = "grey40", size = 11),
+    panel.grid.major.y = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x        = "Serious Reaction Rate",
+    y        = NULL,
+    title    = "Route of Administration: Reflecting the Drugs Behind the Route",
+    subtitle = "Point size = reporting volume; n shown per route; top 12 most-reported routes"
+  )
+```
+
+**Transdermal delivery** (98.7%) and **intraperitoneal injection** (95.0%) have the highest serious reaction rates, but it is important not to interpret this as the route *causing* the severity. Transdermal drugs in this dataset are heavily weighted toward fentanyl patches and hormonal therapies — the drugs themselves drive the outcomes. Similarly, intraperitoneal administration is almost exclusively used in peritoneal dialysis and certain chemotherapy regimens, both of which involve seriously ill patients. **Oral drugs** are the most commonly reported route by a wide margin (196,194 reports) and sit at 75.1%, close to the overall dataset average. **Sublingual** (41.9%) and **inhalation** (47.3%) routes are lowest, dominated by nitroglycerin and asthma inhalers respectively, where many documented reactions are manageable. Route of administration and drug class will likely be collinear in a model — the more informative variable of the two is probably drug class.
+
+#### Polypharmacy
+
+```{r polypharmacy-line, fig.height = 6}
+data %>%
+  filter(drug_count_category != "Unknown") %>%
+  group_by(drug_count_category) %>%
+  summarise(
+    `Serious (any)` = mean(serious == "Yes"),
+    Hospitalized    = mean(is_hospitalized),
+    Fatal           = mean(is_fatal)
+  ) %>%
+  pivot_longer(-drug_count_category, names_to = "Metric", values_to = "Rate") %>%
+  mutate(Metric = factor(Metric,
+                         levels = c("Serious (any)", "Hospitalized", "Fatal"))) %>%
+  ggplot(aes(x = drug_count_category, y = Rate, color = Metric, group = Metric)) +
+  geom_line(linewidth = 1.6) +
+  geom_point(size = 5) +
+  geom_text(aes(label = percent(Rate, accuracy = 0.1)),
+            vjust = -0.9, size = 3.6, fontface = "bold",
+            show.legend = FALSE) +
+  scale_color_manual(
+    values = c("Serious (any)" = "#E64B35",
+               "Hospitalized"  = "#4DBBD5",
+               "Fatal"         = "#4A148C"),
+    name = NULL
+  ) +
+  scale_y_continuous(labels = percent, limits = c(0, 1.0),
+                     breaks = seq(0, 1, 0.1)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(color = "grey40", size = 11),
+    panel.grid.minor = element_blank(),
+    legend.position  = "bottom"
+  ) +
+  labs(
+    x        = "Number of Concurrent Drugs",
+    y        = "Rate",
+    title    = "More Drugs, Worse Outcomes — A Clear Dose-Response Pattern",
+    subtitle = "All three outcome metrics rise monotonically with concurrent drug count"
+  )
+```
+
+The relationship between the number of concurrent drugs and outcome severity is one of the clearest patterns in this dataset. Patients on a **single drug** have a serious reaction rate of 58.8% and a hospitalization rate of 20.3%. Patients on **six or more drugs** (polypharmacy) reach 85.7% serious and 45.2% hospitalization rates. The **fatality rate**, however, rises only modestly — from 9.2% at a single drug to 11.1% with polypharmacy — suggesting that while polypharmacy greatly increases the chance of a reaction being classified as serious, it does not dramatically increase the chance of it being fatal. This makes intuitive sense: polypharmacy often involves drug-drug interactions that cause hospitalisation-level adverse events (e.g., over-anticoagulation, electrolyte imbalances) rather than immediately life-threatening acute reactions. The monotonic dose-response across all three metrics makes `drug_count_category` a compelling candidate predictor.
+
+#### Number of Reactions Reported
+
+```{r num-reactions-violin, fig.height = 5.5}
+data %>%
+  mutate(serious_label = ifelse(serious == "Yes", "Serious", "Non-Serious")) %>%
+  filter(num_reactions <= 30) %>%
+  ggplot(aes(x = serious_label, y = num_reactions, fill = serious_label)) +
+  geom_violin(alpha = 0.55, trim = TRUE, adjust = 2, show.legend = FALSE) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white",
+               color = "grey30", show.legend = FALSE) +
+  stat_summary(fun = mean, geom = "point", shape = 18, size = 4,
+               color = "#333333", show.legend = FALSE) +
+  scale_fill_manual(values = c("Non-Serious" = "#4DBBD5",
+                               "Serious"     = "#E64B35")) +
+  scale_y_continuous(breaks = seq(0, 30, 5)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(
+    x        = NULL,
+    y        = "Number of Distinct Reactions Reported",
+    title    = "Serious Cases Present with Substantially More Symptoms",
+    subtitle = "Capped at 30 for display (true max = 253); diamond = mean"
+  )
+```
+
+Patients with serious reactions report nearly twice as many distinct symptoms on average — a mean of 7.2 reactions compared to 3.7 for non-serious cases. The median difference is smaller (4 vs 3), but the heavier right tail in the serious group is telling: a substantial proportion of serious cases present with 8, 10, or more distinct reactions, reflecting the systemic cascade that characterises severe drug toxicity. This variable will be a useful predictor because it is available at the time of reporting and captures something that drug class alone cannot — the extent of the clinical presentation. It is not a confound (it is measured alongside the outcome), but it is a proxy for how badly the patient was affected, so its role in modelling will need to be considered carefully.
+
+#### Top 20 Suspect Drugs by Serious Reaction Rate
+
+```{r top-drugs, fig.height = 8}
+data %>%
+  group_by(suspect_drug) %>%
+  summarise(n = n(), serious_rate = mean(serious == "Yes")) %>%
+  filter(n >= 500) %>%
+  arrange(desc(serious_rate)) %>%
+  slice_head(n = 20) %>%
+  mutate(
+    drug_label = str_trunc(suspect_drug, 34),
+    drug_label = fct_reorder(drug_label, serious_rate),
+    group = case_when(
+      grepl("OXALIPLATIN|CARBOPLATIN|CYCLOPHOSPHAMIDE|ATEZOLIZUMAB|RITUXIMAB|NIVOLUMAB|JAKAVI|GLIVEC|MYCOPHENOLATE|AFLIBERCEPT", suspect_drug) ~ "Oncology",
+      grepl("RIVAROXABAN|DABIGATRAN|CLOPIDOGREL", suspect_drug) ~ "Anticoagulant/Antiplatelet",
+      grepl("PREDNISOLONE|LANSOPRAZOLE", suspect_drug) ~ "Confounding by indication",
+      grepl("ZANTAC", suspect_drug) ~ "Recalled drug",
+      grepl("CLOZAPINE|CITALOPRAM", suspect_drug) ~ "Psychiatric",
+      grepl("ADVATE|TENOFOVIR", suspect_drug) ~ "Specialist",
+      TRUE ~ "Other"
+    )
+  ) %>%
+  ggplot(aes(x = serious_rate, y = drug_label, color = group)) +
+  geom_segment(aes(x = 0.975, xend = serious_rate, yend = drug_label),
+               color = "grey82", linewidth = 0.8) +
+  geom_point(aes(size = n)) +
+  geom_text(aes(label = percent(serious_rate, accuracy = 0.01)),
+            nudge_x = 0.005, size = 3.2, color = "grey20") +
+  scale_color_manual(
+    values = c(
+      "Oncology"                  = "#E64B35",
+      "Anticoagulant/Antiplatelet"= "#4A148C",
+      "Psychiatric"               = "#2196F3",
+      "Recalled drug"             = "#FF9800",
+      "Confounding by indication" = "#9E9E9E",
+      "Specialist"                = "#4CAF50",
+      "Other"                     = "#607D8B"
+    ),
+    name = "Drug category"
+  ) +
+  scale_size_continuous(range = c(3, 12), name = "Reports", labels = comma) +
+  scale_x_continuous(labels = percent, limits = c(0.972, 1.012),
+                     expand = c(0, 0)) +
+  theme_minimal(base_size = 11.5) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(color = "grey40", size = 11),
+    axis.text.y     = element_text(size = 9.5),
+    panel.grid.major.y = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x        = "Serious Reaction Rate",
+    y        = NULL,
+    title    = "Near-Universal Serious Outcomes: The Top 20 Suspect Drugs",
+    subtitle = "Minimum 500 reports; colour-coded by clinical category; point size = report volume"
+  )
+```
+
+Every drug on this list has a serious reaction rate above 98.3%, among drugs with at least 500 reports. They fall into meaningful clinical clusters:
+
+**Oncology agents** dominate the list — cyclophosphamide (99.6%), oxaliplatin (99.1%), atezolizumab (99.1%), nivolumab (98.4%), carboplatin (99.0%), rituximab (98.5%). These rates are expected: chemotherapy and immunotherapy adverse events (neutropenic fever, immune-related adverse events, peripheral neuropathy) are inherently serious, and reporting thresholds for oncology drugs are low given how closely these patients are monitored.
+
+**Anticoagulants and antiplatelets** — rivaroxaban (99.1%, n = 12,968), dabigatran (98.9%), and clopidogrel (98.4%) — generate near-universal serious outcomes because the reportable adverse events for these drugs (major bleeds, intracranial haemorrhage) are life-threatening by definition.
+
+**Zantac (ranitidine, 99.3%)** deserves special mention. This over-the-counter antacid would not ordinarily appear near the top of such a list, but it was voluntarily recalled in 2020 following the discovery of NDMA contamination. The surge in adverse event reporting around the recall — many prompted by media coverage rather than acute clinical events — inflated the denominator and introduced a strong **reporting artefact**. This drug's position on the list is not a reflection of its clinical toxicity.
+
+**Prednisolone and lansoprazole** are likely examples of **confounding by indication**: these drugs are commonly co-prescribed to very sick patients on complex regimens, and the serious outcomes documented are probably driven by underlying illness severity rather than by the drugs themselves.
+
+
+
+#### Manufacturers
+
+```{r manufacturer}
+
+# frequency table
+agg_manufacturer <- data %>%
+  separate_rows(manufacturer, sep = ";") %>% # separates manufacturers
+  group_by(manufacturer) %>%
+  summarise(
+    Count = n()
+  ) %>%
+  arrange(desc(Count))
+  
+nrow(agg_manufacturer) # total number of unique manufacturers
+# we know it's unique since we did group_by() earlier
+
+# most represented manufacturers in the dataset
+head(agg_manufacturer, 10)
+
+```
+
+There are **1619 unique pharmaceutical manufacturers** represented in this dataset. The most popular manufacturers are **Pfizer, Janssen, Novartis, Genentech, and US Pharmaceuticals.** There are around 76,000 reports where the manufacturer is unknown. 
+
+```{r}
+
+head(agg_manufacturer, 20)[-1,] %>%
+  mutate(manufacturer = fct_reorder(manufacturer, Count, .desc = FALSE)) %>%
+  ggplot(aes(x = manufacturer, y = Count, fill = manufacturer)) + 
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = rainbow(20))  +
+  theme_bw() +
+  labs(
+    x = NULL,
+    y = "Count",
+    title = "Top 20 Most Common Pharmaceutical Manufacturers",
+    subtitle = "Ranked by frequency in dataset"
+  ) +
+  theme(
+    plot.title = element_text(face = "bold"),
+    axis.text.y = element_text(size = 10)
+   # plot.margin = margin(10, 20, 10, 20)
+  )
+
+```
+We will take the top 20 most common manufacturers in the data set and check their rate of producing medications that trigger serious reactions:
+
+```{r}
+
+manufacturer_rate <- data %>%
+  separate_rows(manufacturer, sep = ";") %>% # separates collab manufacturers
+  group_by(manufacturer) %>%
+  summarise(
+    n = n(),
+    reaction_rate = mean(serious == "Yes", na.rm = TRUE) # larger = more serious reactions
+  ) %>%
+  arrange(desc(n), desc(reaction_rate))
+
+knitr::kable(head(manufacturer_rate, 10), col.names = c("Manufacturer", "Count", "Rate of Serious Reaction")) %>% kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+
+
+```
+
+We separate drugs with multiple associated manufacturers into multiple rows, with all other columns duplicated, in order to avoid having rare multi-manufacturer combinations appear to have artificially high serious reaction rates.
+
+```{r}
+head(manufacturer_rate, 20)[-1,] %>%
+  mutate(manufacturer = fct_reorder(manufacturer, reaction_rate, .desc = FALSE)) %>%
+  ggplot(aes(x = manufacturer, y = reaction_rate, fill = manufacturer)) + 
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = rainbow(20))  +
+  theme_bw(base_size = 12) +
+  labs(
+    x = NULL,
+    y = "Rate of Serious Reaction (0-1)",
+    title = "Manufacturers with Highest Rate of Serious Drug Reactions",
+    subtitle = "Of the 20 Most Represented Manufacturers in the Dataset"
+  ) #+
+#  theme(
+ #   plot.title = element_text(face = "bold"),
+  #  axis.text.y = element_text(size = 10),
+   # plot.margin = margin(10, 20, 10, 20)
+  #)
+```
+
+There is a clear difference between large manufacturers who are highly represented in the data set and the manufacturers producing pharmaceuticals with high rates of serious reactions, **suggesting that manufacturer may be a significant factor in predicting seriousness of drug reaction.**
+
+
+# EDA Summary and Modeling Motivation
+
+The exploratory analysis shows that adverse event severity is connected to patient and drug characteristics. The clearest patterns are tied to **patient age, the number of drugs taken at the same time, the number of reactions listed in a report, the suspect drug, the drug class, and the route of administration**. In the following section, we ask whether those patterns are strong enough to support prediction.
+
+The main research question here is: Given a patient and drug profile, can we predict whether the adverse event outcome will be serious?
+
+The models below use the same general predictors discussed in the EDA. They predict the serious outcome flag as a binary outcome, where 1 means serious and 0 means not serious.
+
+```{r age plot}
+
+#data %>%
+#  ggplot(aes(x = age_group, fill = age_group)) #+
+#  geom_bar(show.legend = FALSE) +
+##  scale_fill_manual(values = rainbow(8))  +
+#  theme(axis.text.x = element_text(angle = 30, hjust = 1)) +
+#  theme_bw() +
+#  labs(x = "Age Group", y = "Count", title  = "Number of Adverse Reactions per Age Group")
+  
+```
+
+## Methods
+
+Our goal is to predict whether a drug adverse event will be classified as serious (Yes/No) from patient and drug characteristics available at the time of reporting. We compare four modeling approaches — standard logistic regression, logistic LASSO, relaxed logistic LASSO, neural networks, and extreme gradient boosting — each suited to different trade-offs between interpretability, variable selection, and predictive power.
+
+### Data Splits
+
+For logistic regression and LASSO based models, we use the complete case subset (`data1`, ~39,000 rows) after removing all rows with NA or "Unknown" values, since these methods cannot handle missing data. We apply a stratified 70/30 train test split (seed = 42) using `createDataPartition()` to preserve the class ratio across both sets. For neural network models, rows missing `patient_age_years` were removed but `patient_weight_kg` was median imputed; an 80/20 stratified split was used. For XGBoost, the full 528,000 row dataset is used with an 80/20 random split, as XGBoost internally handles missingness as informative.
+
+All models predict the binary outcome `serious` (1 = Yes, 0 = No).
+
+### Model 1: Logistic Regression
+
+Logistic regression models the log odds of a serious outcome as a linear function of predictors:
+
+$$\log\left[\frac{P(\text{serious}=1)}{P(\text{serious}=0)}\right] = \beta_0 + \beta_1 \cdot \text{age} + \beta_2 \cdot \text{sex} + \beta_3 \cdot \text{weight} + \cdots$$
+
+Exponentiating any coefficient $\beta_j$ gives the odds ratio for that predictor. We include patient age (continuous and grouped), sex, weight, and drug count category. High cardinality factors (`pharm_class`, `country`) are excluded here to prevent hundreds of redundant dummy coefficients; these are addressed by LASSO in Model 2. Logistic regression serves as an interpretable baseline with direct odds ratio output.
+
+### Model 2: Logistic LASSO Regression
+
+LASSO (Least Absolute Shrinkage and Selection Operator) adds an L1 penalty to the log likelihood:
+
+$$\text{maximise} \quad \ell(\boldsymbol{\beta}) - \lambda \sum_j |\beta_j|$$
+
+The penalty simultaneously shrinks coefficients toward zero and performs automatic variable selection — coefficients for uninformative predictors are set to exactly zero. This is especially valuable here because one hot encoding `pharm_class` (448 levels) and `country` (162 levels) produces a high dimensional sparse matrix where most dummy variables are not genuinely predictive. Near zero variance columns (474 removed using `nearZeroVar()`) are excluded before fitting to prevent convergence issues. The penalty strength $\lambda$ is selected by 10 fold cross validation maximizing AUC; we report results at $\lambda_{\min}$ (highest CV AUC). Implemented via `glmnet` with `alpha = 1`.
+
+### Model 3: Relaxed Logistic LASSO Regression
+
+A known limitation of LASSO is shrinkage bias: even truly important predictors have their coefficients attenuated. The relaxed LASSO corrects this by blending the penalized LASSO fit with an unpenalized re fit on the selected variable subset:
+
+$$\hat{\boldsymbol{\beta}}_{\text{relaxed}}(\lambda, \gamma) = \gamma \cdot \hat{\boldsymbol{\beta}}_{\text{LASSO}}(\lambda) + (1-\gamma) \cdot \hat{\boldsymbol{\beta}}_{\text{MLE}}(S_\lambda)$$
+
+where $\gamma \in [0,1]$ controls the blend ($\gamma = 1$: standard LASSO; $\gamma = 0$: fully unpenalized re fit on the selected subset). The optimal $(\lambda, \gamma)$ pair is chosen jointly by 10 fold cross validation. This retains LASSO's variable selection while recovering less biased coefficient estimates. Implemented via `cv.glmnet(..., relax = TRUE)`.
+
+### Model 4: Neural Networks
+
+Neural networks capture non linear interactions between predictors (e.g., age and polypharmacy, drug class and number of reactions) that linear models cannot fully represent. All three architectures use the same features: year, month, number of reactions, number of drugs, patient age, patient weight, sex, age group, drug count category, suspect drug, brand name, drug indication, pharmaceutical class, and drug route. Categorical variables are integer encoded after lumping rare levels into "Other" (top 50 retained). All features are standardized using training set means and standard deviations.
+
+Three architectures of increasing complexity are compared on the same train/test split:
+
+| Architecture | Layers | Regularization |
+|---|---|---|
+| Baseline shallow | Input to 100 to 50 to 1 | Dropout (0.30, 0.20); early stopping |
+| Deep dense | Input to 256 to 128 to 64 to 32 to 1 | L2 regularization; batch norm; dropout 0.40 to 0.20 |
+| Wide and deep | Input to 512 to 256 to 128 to 1 | L2 regularization; dropout 0.50 to 0.40 to 0.30 |
+
+All models use Adam (learning rate = 0.001), binary cross entropy loss, batch size 512, and up to 100 epochs. Early stopping (patience = 15) restores the best validation weights. The deep and wide models additionally use `ReduceLROnPlateau` to halve the learning rate when validation loss plateaus. Feature importance is assessed via permutation: each feature is shuffled in the test set and the resulting AUC drop quantifies its contribution.
+
+### Model 5: Extreme Gradient Boosting (XGBoost)
+
+XGBoost fits an additive ensemble of decision trees by sequentially minimizing a regularized objective. Unlike the regression based models, it natively handles missing values by learning optimal default split directions for NA entries at each node, eliminating the need to drop or impute the 72% of records missing weight or the 29% missing age. We use `objective = "binary:logistic"` with AUC as the evaluation metric. `scale_pos_weight` is set to the ratio of negative to positive training examples to account for class imbalance.
+
+Two models are fit: (1) a model including country as a predictor, and (2) a model excluding country. Country was found to explain approximately 43% of the first model's gain, driven by reporting bias (US serious rate approximately 0.65 vs. non US approximately 0.90 or above) rather than true clinical risk, so the country free model is used as the primary result. Categorical predictors are one hot encoded into a sparse matrix using `sparse.model.matrix()`. The number of boosting rounds (500) was chosen after cross validation showed AUC continuing to improve but with diminishing returns beyond that point. Hyperparameters: `eta = 0.1`, `max_depth = 6`, `subsample = 0.8`, `colsample_bytree = 0.8`.
+
+### Model Evaluation
+
+All models are evaluated on the held out test set using: **AUC** (threshold free discriminative ability), **accuracy**, **sensitivity** (true positive rate, clinically most important since missing a serious outcome carries higher cost), and **specificity**. For neural networks, precision, recall, and F1 are also reported. Permutation importance is used to rank neural network inputs. XGBoost feature importance is assessed via the built in gain metric.
+
+
+
+## Results
+
+
+```{r}
+
+# replace unknowns with NAs
+
+data <- data %>%
+  dplyr::select(-2) %>%
+  mutate(across(where(~ is.character(.) || is.factor(.)), ~ na_if(as.character(.), "Unknown"))) %>%
+  mutate(
+   serious = as.factor(serious),
+   serious_flags = as.factor(serious_flags),
+   is_fatal = as.factor(is_fatal),
+   is_hospitalized = as.factor(is_hospitalized),
+   is_life_threat = as.factor(is_life_threat),
+   is_disabling = as.factor(is_disabling),
+   reactions = as.factor(reactions),
+   primary_reaction = as.factor(primary_reaction),
+   patient_recovered = as.factor(patient_recovered),
+   suspect_drug = as.factor(suspect_drug),
+   brand_name = as.factor(brand_name),
+   drug_indication = as.factor(drug_indication),
+   pharm_class = as.factor(pharm_class),
+   drug_count_category = as.factor(drug_count_category),
+   age_group = factor(age_group, levels = c("Infant(0-2)", "Child(3-12)", "Teen(13-18)", "Adult(19-40)", "Middle-Aged(41-65)", "Senior(66-80)", "Elderly(81+)", NA )),
+   patient_sex = as.factor(patient_sex),
+   country = as.factor(country)
+  )
+
+# check how many levels each factor has
+sapply(data, function(x) if (is.factor(x)) nlevels(x))
+
+# having so many levels to a factor is not good - limit to 50
+
+data$reactions <- fct_lump(data$reactions, n = 50)
+data$primary_reaction <- fct_lump(data$primary_reaction, n = 50)
+data$suspect_drug <- fct_lump(data$suspect_drug, n = 50)
+data$brand_name <- fct_lump(data$brand_name, n = 50)
+data$drug_indication <- fct_lump(data$drug_indication, n = 50)
+data$pharm_class <- fct_lump(data$pharm_class, n = 50)
+data$country <- fct_lump(data$country, n = 50)
+```
+```{r}
+
+# version 2: treating missingness as informative
+# use with sparse matrix for boosting
+#data <- data %>%
+#  dplyr::select(-2) %>%
+#  mutate(across(where(~ is.character(.) || is.factor(.)),
+#                ~ na_if(as.character(.), "Unknown"))) %>%
+#  mutate(across(where(is.character), as.factor)) %>%
+##  mutate(across(where(is.factor), fct_na_value_to_level)) %>%
+#  mutate(
+#    reactions = fct_lump(reactions, n = 50),
+##    primary_reaction = fct_lump(primary_reaction, n = 50),
+#    suspect_drug = fct_lump(suspect_drug, n = 50),
+#    brand_name = fct_lump(brand_name, n = 50),
+#    drug_indication = fct_lump(drug_indication, n = 50),
+#    pharm_class = fct_lump(pharm_class, n = 50),
+#    country = fct_lump(country, n = 50)
+#  )
+
+#sapply(data, function(x) if (is.factor(x)) nlevels(x))
+
+#str(data)
+```
+
+
+```{r remove missing}
+
+# new dataset without any unknown or NA values
+data1 <- data %>%
+  mutate(across(where(~ is.character(.) || is.factor(.)), ~ na_if(as.character(.), "Unknown"))) %>%
+  drop_na() %>%
+  mutate(
+   serious = as.factor(serious),
+   serious_flags = as.factor(serious_flags),
+   is_fatal = as.factor(is_fatal),
+   is_hospitalized = as.factor(is_hospitalized),
+   is_life_threat = as.factor(is_life_threat),
+   is_disabling = as.factor(is_disabling),
+   reactions = as.factor(reactions),
+   primary_reaction = as.factor(primary_reaction),
+   patient_recovered = as.factor(patient_recovered),
+   suspect_drug = as.factor(suspect_drug),
+   brand_name = as.factor(brand_name),
+   drug_indication = as.factor(drug_indication),
+   pharm_class = as.factor(pharm_class),
+   drug_count_category = as.factor(drug_count_category),
+   age_group = factor(age_group, levels = c("Infant(0-2)", "Child(3-12)", "Teen(13-18)", "Adult(19-40)", "Middle-Aged(41-65)", "Senior(66-80)", "Elderly(81+)", "Unknown" )),
+   patient_sex = as.factor(patient_sex),
+   country = as.factor(country)
+  )
+
+dim(data1) # 528k -> 39k
+
+skimr::skim(data1) # no missing for age or weight now
+
+data1 %>%
+  summarise(across(everything(), ~ sum(. == "Unknown", na.rm = TRUE))) %>%
+  pivot_longer(cols = everything(),
+               names_to = "column",
+               values_to = "unknown_count") %>%
+  arrange(desc(unknown_count)) # no unknowns either!
+```
+
+
+### Logistic Regression
+
+```{r model-data-prep}
+# ============================================================
+# DATA PREPARATION FOR PREDICTIVE MODELING
+# ============================================================
+# The core research question is: "Given a patient and drug, can we
+# predict how serious the outcome will be?" We therefore select ONLY
+# features that would realistically be known at the time of prescribing
+# or reporting — before an outcome is observed.
+#
+# PREDICTORS INCLUDED
+#   Patient-level:  patient_age_years, patient_sex, patient_weight_kg,
+#                   age_group
+#   Drug-level:     drug_route (FDA numeric route code, treated as
+#                   categorical), num_drugs, drug_count_category,
+#                   pharm_class, country
+#
+# PREDICTORS EXCLUDED (to prevent data leakage)
+#   Outcome-adjacent variables that are only known AFTER a serious event
+#   occurs are excluded: is_fatal, is_hospitalized, is_life_threat,
+#   is_disabling, reactions, primary_reaction, reaction_outcomes,
+#   patient_recovered, serious_flags, num_reactions.
+#   Administrative IDs (report_id, report_age_days) and time variables
+#   (year, month, quarter) are also excluded as they do not reflect
+#   patient/drug characteristics.
+#   High-cardinality drug identifiers (suspect_drug with ~9,800 levels
+#   and brand_name) are excluded here; their signal is partially captured
+#   through pharm_class and drug_count_category.
+#
+# RESPONSE: serious (binary: "Yes" → 1, "No" → 0)
+
+# drug_route is stored as numeric FDA route codes but represents
+# distinct administration categories — treat as a factor.
+data1 <- data1 %>%
+  mutate(drug_route = as.factor(drug_route))
+
+# Build the modeling dataset and drop any residual unused factor levels.
+model_data <- data1 %>%
+  dplyr::select(
+    serious,
+    # Patient features
+    patient_age_years, patient_sex, patient_weight_kg, age_group,
+    # Drug / polypharmacy features
+    drug_route, num_drugs, drug_count_category, pharm_class, country
+  ) %>%
+  droplevels() %>%          # remove empty factor levels after cleaning
+  mutate(serious = factor(ifelse(serious == "Yes", 1, 0), levels = c(0, 1)))
+
+# Note: data1 is already ~39k rows after removing rows with any Unknown
+# or NA. The outcome is moderately imbalanced; we use stratified splitting
+# to preserve the class ratio in both the training and test sets.
+
+# Stratified 70 / 30 train–test split
+set.seed(42)
+train_idx <- createDataPartition(model_data$serious, p = 0.70, list = FALSE)
+train_df  <- model_data[ train_idx, ]
+test_df   <- model_data[-train_idx, ]
+
+cat("Training set:", nrow(train_df), "observations\n")
+cat("Test set:    ", nrow(test_df),  "observations\n")
+cat("Class balance in training set:\n")
+print(prop.table(table(train_df$serious)))
+```
+
+```{r logistic-regression}
+# ============================================================
+# MODEL 1: STANDARD LOGISTIC REGRESSION
+# ============================================================
+# Logistic regression is the natural baseline for binary classification.
+# It models the log-odds of the outcome as a linear function of the
+# predictors:
+#
+#   log [ P(serious = 1) / P(serious = 0) ]
+#       = β₀ + β₁·age + β₂·sex + ... + βₚ·Xₚ
+#
+# Exponentiating any coefficient βⱼ gives the ODDS RATIO for that
+# predictor: how much the odds of a serious outcome multiply for a
+# one-unit increase in Xⱼ, holding everything else constant.
+#
+# WHY THIS MODEL?
+#   • The outcome is strictly binary (serious: Yes/No).
+#   • Coefficients are directly interpretable as odds ratios.
+#   • It is a well-validated method for adverse-event prediction in
+#     pharmacovigilance literature.
+#   • It provides a transparent baseline against which the penalized
+#     models below can be fairly compared.
+#
+# PREDICTOR CHOICE FOR THIS MODEL
+#   We use only patient-level features and the lower-cardinality drug
+#   features (drug_count_category) here. Higher-cardinality categorical
+#   factors like pharm_class (448 levels) and country (162 levels) would
+#   generate hundreds of coefficients that inflate variance and inflate
+#   standard errors; the LASSO in Model 2 is the appropriate tool for
+#   those. Including both num_drugs (continuous) and drug_count_category
+#   (its categorical binning) would be redundant, so we use
+#   drug_count_category for interpretability.
+
+glm_fit <- glm(
+  serious ~ patient_age_years + patient_sex + patient_weight_kg +
+            age_group + drug_count_category,
+  data   = train_df,
+  family = binomial(link = "logit")
+)
+
+summary(glm_fit)
+
+# --- Odds Ratios with 95% confidence intervals ---
+# OR > 1: predictor increases the odds of a serious outcome.
+# OR < 1: predictor is associated with lower odds of serious outcome.
+or_table <- exp(cbind(OR = coef(glm_fit), confint(glm_fit)))
+knitr::kable(round(or_table, 3),
+             caption = "Odds Ratios — Standard Logistic Regression")
+
+# --- Predictions on the held-out test set ---
+glm_pred_prob  <- predict(glm_fit, newdata = test_df, type = "response")
+glm_pred_class <- ifelse(glm_pred_prob >= 0.5, 1, 0)
+
+# --- Confusion matrix ---
+glm_cm <- confusionMatrix(
+  factor(glm_pred_class, levels = c(0, 1)),
+  factor(as.numeric(as.character(test_df$serious)), levels = c(0, 1)),
+  positive = "1"
+)
+print(glm_cm)
+
+# --- ROC curve and AUC ---
+# AUC (area under the ROC curve) summarises discriminative ability
+# across all classification thresholds:
+#   AUC = 0.5 → no better than random guessing
+#   AUC = 1.0 → perfect separation
+glm_roc <- roc(as.numeric(as.character(test_df$serious)),
+               glm_pred_prob, quiet = TRUE)
+cat("Logistic Regression AUC:", round(auc(glm_roc), 4), "\n")
+
+# --- Interpretation note ---
+# The model coefficients quantify the independent contribution of each
+# predictor to the log-odds of a serious outcome. For example:
+#   • A significant positive coefficient on Polypharmacy(6+) would
+#     indicate that taking 6 or more drugs substantially raises the
+#     odds of a serious reaction relative to taking a single drug.
+#   • Age group effects show how risk accumulates across the lifespan.
+# Coefficients for patient_sex and weight reflect any differential
+# susceptibility after controlling for age and drug burden.
+
+
+```
+
+### Logistic LASSO Regression
+The logistic LASSO model demonstrates strong discriminative performance, achieving an AUC of approximately 0.84 (able to correctly rank a randomly selected serious case above a non-serious case roughly 84% of the time). When evaluated at the Youden-optimal classification threshold, the model achieves a sensitivity of 0.687 and a specificity of 0.892, resulting in a balanced accuracy of 0.789. We tested the default 0.5 threshold, but it performs poorly when the outcome is imbalanced (~75% serious): it predicts nearly everything positive, yielding ~0 specificity. We thus use the Youden-optimal threshold (maximises sensitivity + specificity − 1) derived from the ROC curve, which is also consistent with the approach used in Model 1. Although the overall accuracy (0.708) is lower than the no-information rate (0.898), we believe the trade-off is worth it (sacrifice some raw accuracy to achieve meaningful specificity, which is critical given the strong class imbalance toward serious outcomes in the data and for useful application in hospital resource allocation decisions).
+
+The cross-validation results further support the model’s performance. AUC increases steadily from near-chance levels (approximately 0.63) in the null model to around 0.84 as predictors are introduced, before plateauing. This plateau suggests diminishing returns from including additional variables, with most predictive signal captured by a relatively small subset of features. At the optimal λ (λ.min), the model retains 21 non-zero predictors, while the λ.1se solution retains approximately 17 predictors with only a negligible reduction in AUC. This indicates that a more parsimonious model can achieve nearly identical predictive performance.
+
+Inspection of the selected predictors reveals several clinically meaningful patterns. Among the strongest risk-increasing variables, pharmaceutical class plays a dominant role. Programmed Death Receptor-1 (PD-1) blocking antibodies exhibit the largest positive effect, consistent with their use in cancer immunotherapy and their known association with serious immune-related adverse events. Tumor necrosis factor (TNF) blockers also show a positive association, aligning with their established risks of infection and autoimmune complications. Country-level effects are notable, with reports from France and Canada associated with higher odds of serious outcomes, potentially reflecting differences in reporting practices or healthcare systems. Polypharmacy, particularly the use of six or more drugs, is associated with increased risk, as expected. Male sex and older age groups, especially patients aged 66 and above, also contribute positively to risk. Certain routes of administration, such as intramuscular and subcutaneous delivery, are associated with higher odds, likely reflecting the types of drugs administered via these routes.
+
+Conversely, several predictors are associated with reduced odds of serious outcomes. Reports originating in the United States show a strong negative association, possibly due to higher reporting volumes that include a greater proportion of non-serious events. Germany exhibits a similar but less pronounced effect. Kinase inhibitors are associated with lower risk in this dataset after controlling for other variables. Oral administration is also linked to lower odds of serious outcomes, consistent with the generally less acute nature of orally administered therapies. Finally, patients taking a single drug show slightly reduced risk compared to those exposed to multiple medications.
+
+```{r lasso-regression}
+# ============================================================
+# MODEL 2: LOGISTIC LASSO REGRESSION
+# ============================================================
+# LASSO (Least Absolute Shrinkage and Selection Operator) solves a
+# penalised maximum-likelihood problem:
+#
+#   maximise  ℓ(β) − λ · Σⱼ |βⱼ|
+#
+# The L1 penalty term λ·Σ|βⱼ| simultaneously shrinks coefficients
+# toward zero AND sets many of them to exactly zero, performing
+# automatic variable selection. This is especially valuable here
+# because:
+#   (a) The full predictor matrix is high-dimensional after one-hot
+#       encoding pharm_class (448 levels) and country (162 levels);
+#   (b) We expect only a sparse subset of drug classes / countries to
+#       be genuinely predictive of seriousness;
+#   (c) LASSO prevents overfitting in the presence of correlated or
+#       redundant dummy variables.
+#
+# The penalty strength λ is selected by 10-fold cross-validation,
+# optimising the area under the ROC curve (AUC):
+#   λ.min → λ that maximises mean CV-AUC (best predictive accuracy)
+#   λ.1se → largest λ within one standard error of the minimum
+#           (sparser model, slightly more regularised)
+#
+# We use glmnet with alpha = 1 (pure LASSO). Setting alpha between
+# 0 and 1 would give elastic net; alpha = 0 gives ridge regression.
+
+# --- Build the full model matrix for glmnet ---
+# model.matrix() one-hot encodes all factor variables. We drop the
+# intercept column (glmnet adds its own). We use the Matrix package's
+# sparse representation to keep memory use manageable with many dummy
+# columns from pharm_class and country.
+#
+# REDUNDANT VARIABLE REMOVAL
+#   patient_age_years and age_group both encode patient age — including
+#   both introduces collinearity where the continuous variable competes
+#   with the age-group dummies for the same variance. We drop
+#   patient_age_years and retain age_group for consistency with Model 1
+#   and because LASSO's group-selection properties work better with
+#   a single representation of each construct.
+#   Likewise, num_drugs is excluded in favour of drug_count_category.
+X_train <- sparse.model.matrix(
+  serious ~ . - patient_age_years - num_drugs,
+  data = train_df
+)[, -1]
+y_train <- as.numeric(as.character(train_df$serious))
+
+X_test <- sparse.model.matrix(
+  serious ~ . - patient_age_years - num_drugs,
+  data = test_df
+)[, -1]
+y_test <- as.numeric(as.character(test_df$serious))
+
+# Align columns: the test matrix may be missing rare factor levels
+# that only appear in the training data. Add zero columns for those.
+missing_cols <- setdiff(colnames(X_train), colnames(X_test))
+if (length(missing_cols) > 0) {
+  pad <- Matrix(0, nrow = nrow(X_test), ncol = length(missing_cols),
+                sparse = TRUE,
+                dimnames = list(NULL, missing_cols))
+  X_test <- cbind(X_test, pad)
+}
+X_test <- X_test[, colnames(X_train)]  # reorder columns to match training
+
+nzv_idx <- nearZeroVar(X_train, freqCut = 19, uniqueCut = 10)
+if (length(nzv_idx) > 0) {
+  cat("Removing", length(nzv_idx),
+      "near-zero variance columns from the model matrix\n")
+  X_train <- X_train[, -nzv_idx]
+  X_test  <- X_test[,  -nzv_idx]
+}
+cat("Final model matrix dimensions — train:", dim(X_train),
+    "| test:", dim(X_test), "\n")
+
+# --- 10-fold cross-validation to select λ ---
+set.seed(42)
+lasso_cv <- cv.glmnet(
+  x            = X_train,
+  y            = y_train,
+  alpha        = 1,             # L1 penalty → LASSO
+  family       = "binomial",
+  nfolds       = 10,
+  type.measure = "auc"          # select λ that maximises CV-AUC
+)
+
+plot(lasso_cv)
+title("LASSO Cross-Validation: AUC vs. log(λ)", line = 2.5)
+
+cat("Optimal λ (min AUC):   ", round(lasso_cv$lambda.min, 6), "\n")
+cat("Optimal λ (1-SE rule): ", round(lasso_cv$lambda.1se, 6), "\n")
+
+# Number of predictors retained at each threshold
+n_min <- sum(coef(lasso_cv, s = "lambda.min") != 0) - 1   # subtract intercept
+n_1se <- sum(coef(lasso_cv, s = "lambda.1se") != 0) - 1
+cat("Non-zero predictors at λ.min:", n_min, "\n")
+cat("Non-zero predictors at λ.1se:", n_1se, "\n")
+
+# --- Visualise the top selected coefficients at λ.min ---
+lasso_coef_mat <- coef(lasso_cv, s = "lambda.min")
+lasso_coef_df <- data.frame(
+  predictor   = rownames(lasso_coef_mat),
+  coefficient = as.vector(lasso_coef_mat)
+) %>%
+  filter(predictor != "(Intercept)", coefficient != 0) %>%
+  arrange(desc(abs(coefficient)))
+
+ggplot(head(lasso_coef_df, 25),
+       aes(x = reorder(predictor, coefficient),
+           y = coefficient,
+           fill = coefficient > 0)) +
+  geom_col(show.legend = FALSE) +
+  coord_flip() +
+  scale_fill_manual(values = c("#d73027", "#4575b4"),
+                    labels = c("Negative (protective)",
+                               "Positive (risk-increasing)")) +
+  theme_bw(base_size = 11) +
+  labs(
+    title    = "Top 25 LASSO Coefficients at λ.min",
+    subtitle = "Positive = increases log-odds of serious outcome; Negative = decreases",
+    x        = NULL,
+    y        = "Coefficient (log-odds scale)"
+  )
+
+# --- ROC curve and optimal classification threshold ---
+# The default 0.5 threshold performs poorly when the outcome is
+# imbalanced (~75% serious): it predicts nearly everything positive,
+# yielding ~0 specificity. We instead use the Youden-optimal threshold
+# (maximises sensitivity + specificity − 1) derived from the ROC curve,
+# consistent with the approach used in Model 1.
+lasso_pred_prob <- as.vector(
+  predict(lasso_cv, newx = X_test, s = "lambda.min", type = "response")
+)
+lasso_roc <- roc(y_test, lasso_pred_prob, quiet = TRUE)
+cat("Logistic LASSO AUC (λ.min):", round(auc(lasso_roc), 4), "\n")
+
+lasso_best_coords <- coords(lasso_roc, "best", best.method = "youden",
+                             ret = c("threshold", "sensitivity", "specificity"))
+lasso_threshold <- lasso_best_coords$threshold
+cat("Optimal threshold (Youden):", round(lasso_threshold, 4), "\n")
+cat("  Sensitivity at threshold:", round(lasso_best_coords$sensitivity, 4), "\n")
+cat("  Specificity at threshold:", round(lasso_best_coords$specificity, 4), "\n")
+
+# --- Predictions and confusion matrix at optimal threshold ---
+lasso_pred_class <- ifelse(lasso_pred_prob >= lasso_threshold, 1, 0)
+
+lasso_cm <- confusionMatrix(
+  factor(lasso_pred_class, levels = c(0, 1)),
+  factor(y_test, levels = c(0, 1)),
+  positive = "1"
+)
+print(lasso_cm)
+
+```
+
+### Relaxed Logistic LASSO Regression
+
+The relaxed LASSO cross-validation results indicate that predictive performance is largely insensitive to the degree of shrinkage, with AUC stabilizing around 0.84–0.85 across all values of the relaxation parameter γ. The near overlap of the curves confirms that reducing shrinkage does not meaningfully improve discrimination. The optimal solution occurs at γ ≈ 0, corresponding to a fully unpenalized refit on the LASSO-selected variables, yet this yields essentially identical AUC to the standard LASSO model.
+
+However, when evaluated at the ROC-optimized classification threshold, the model achieves a more balanced performance, with sensitivity ≈ 0.69 and specificity ≈ 0.89 (balanced accuracy ≈ 0.79), demonstrating that the earlier classification issues were largely driven by the default threshold rather than poor underlying model fit.
+
+The coefficient estimates further reinforce that a small set of clinically meaningful predictors drives risk. Drug class—particularly PD-1 inhibitors—remains the dominant positive predictor, along with country, route of administration, polypharmacy, male sex, and older age groups. Negative predictors include U.S. and German reports, oral drug routes, and kinase inhibitors. Compared to standard LASSO, coefficients are larger in magnitude, reflecting reduced shrinkage bias, but the set of selected predictors remains effectively unchanged.
+
+Overall, these results suggest that predictive performance is driven primarily by variable selection rather than coefficient shrinkage. Once the key predictors are identified, adjusting their magnitudes has minimal impact on discrimination, though it improves interpretability and calibration of the estimated effects.
+
+```{r relaxed-lasso}
+# ============================================================
+# MODEL 3: RELAXED LOGISTIC LASSO REGRESSION
+# ============================================================
+# A well-known limitation of LASSO is that the L1 penalty introduces
+# SHRINKAGE BIAS: even truly important predictors have their
+# coefficients pulled toward zero. The relaxed LASSO
+# (Meinshausen, 2007; Hastie, Tibshirani & Tibshirani, 2020) corrects
+# for this by blending the standard LASSO fit with an unpenalised
+# re-fit on the LASSO-selected variables:
+#
+#   β̂_relaxed(λ, γ) = γ · β̂_LASSO(λ) + (1 − γ) · β̂_MLE(S_λ)
+#
+# where S_λ is the set of variables with non-zero LASSO coefficients
+# and β̂_MLE(S_λ) is the maximum-likelihood estimate on that subset.
+# The mixing parameter γ ∈ [0, 1] controls the trade-off:
+#   γ = 1 → identical to standard LASSO (full shrinkage)
+#   γ = 0 → fully relaxed: unpenalised logistic regression on the
+#            LASSO-selected predictor set (zero shrinkage bias)
+#
+# WHY IS THIS USEFUL HERE?
+#   • LASSO's variable selection identifies the relevant subset of
+#     predictors (useful given the high dimensionality of pharm_class
+#     and country dummies).
+#   • The unpenalised re-fit on that subset recovers unbiased
+#     coefficient estimates and standard errors, making the model
+#     more interpretable and typically improving calibration.
+#   • The optimal (λ, γ) pair is chosen jointly by cross-validation,
+#     so no additional tuning decisions are required.
+#
+# X_train and X_test carry forward from the LASSO chunk, already
+# filtered for near-zero variance columns and with redundant variables
+# (patient_age_years, num_drugs) excluded.
+#
+# In glmnet ≥ 3.0 the relaxed LASSO is available via relax = TRUE.
+
+set.seed(42)
+relaxed_cv <- cv.glmnet(
+  x            = X_train,
+  y            = y_train,
+  alpha        = 1,
+  family       = "binomial",
+  nfolds       = 10,
+  type.measure = "auc",
+  relax        = TRUE
+)
+
+# CV plot
+par(mar = c(5, 4, 4, 2), oma = c(0, 0, 5, 0))
+plot(relaxed_cv)
+mtext(
+  "Relaxed LASSO Cross-Validation: AUC vs. log(λ)",
+  side = 3, line = 3, outer = TRUE, cex = 1.2, font = 2
+)
+
+# Optimal (λ, γ) from CV
+opt_lambda <- relaxed_cv$lambda.min
+opt_gamma  <- relaxed_cv$relaxed$gamma.min
+cat("Relaxed LASSO — optimal λ:", round(opt_lambda, 6), "\n")
+cat("Relaxed LASSO — optimal γ:", round(opt_gamma,  4),  "\n")
+cat("(γ = 0 → fully unpenalised re-fit; γ = 1 → standard LASSO)\n")
+
+# Number of non-zero predictors at optimal (λ, γ)
+relaxed_coef_mat <- coef(relaxed_cv, s = "lambda.min", gamma = opt_gamma)
+n_relaxed <- sum(relaxed_coef_mat != 0) - 1
+cat("Non-zero predictors (relaxed, λ.min):", n_relaxed, "\n")
+
+# --- Coefficient plot ---
+relaxed_coef_df <- data.frame(
+  predictor   = rownames(relaxed_coef_mat),
+  coefficient = as.vector(relaxed_coef_mat)
+) %>%
+  filter(predictor != "(Intercept)", coefficient != 0) %>%
+  arrange(desc(abs(coefficient))) %>%
+  slice_head(n = 25) %>%
+  mutate(
+    predictor_clean = predictor %>%
+      str_replace_all("pharm_class",          "Pharm class: ")  %>%
+      str_replace_all("drug_route",            "Drug route: ")   %>%
+      str_replace_all("country",               "Country: ")      %>%
+      str_replace_all("patient_sex",           "Sex: ")          %>%
+      str_replace_all("age_group",             "Age group: ")    %>%
+      str_replace_all("drug_count_category",   "Drug count: ")   %>%
+      str_wrap(width = 35)
+  )
+
+ggplot(relaxed_coef_df,
+       aes(x = reorder(predictor_clean, coefficient),
+           y = coefficient,
+           fill = coefficient > 0)) +
+  geom_col(show.legend = FALSE, width = 0.8) +
+  coord_flip() +
+  scale_fill_manual(values = c("#d73027", "#4575b4")) +
+  labs(
+    title    = "Top 25 Relaxed LASSO Coefficients at Optimal (λ, γ)",
+    subtitle = paste0("γ = ", round(opt_gamma, 3),
+                      " — coefficients are partially/fully de-biased"),
+    x        = NULL,
+    y        = "Coefficient (log-odds scale)"
+  ) +
+  theme_bw(base_size = 11) +
+  theme(
+    plot.title    = element_text(size = 16, face = "bold"),
+    plot.subtitle = element_text(size = 11),
+    axis.text.y   = element_text(size = 9),
+    axis.text.x   = element_text(size = 10),
+    plot.margin   = ggplot2::margin(15, 20, 15, 20)
+  )
+
+# --- ROC curve and Youden-optimal threshold ---
+# As in Models 1 and 2, the default 0.5 threshold produces near-zero
+# specificity under the ~90% class imbalance. We use the Youden index
+# to select the threshold that best balances sensitivity and specificity.
+relaxed_pred_prob <- as.vector(
+  predict(relaxed_cv, newx = X_test, s = "lambda.min",
+          gamma = opt_gamma, type = "response")
+)
+relaxed_roc <- roc(y_test, relaxed_pred_prob, quiet = TRUE)
+cat("Relaxed LASSO AUC (λ.min, opt γ):", round(auc(relaxed_roc), 4), "\n")
+
+relaxed_best_coords <- coords(relaxed_roc, "best", best.method = "youden",
+                               ret = c("threshold", "sensitivity", "specificity"))
+relaxed_threshold <- relaxed_best_coords$threshold
+cat("Optimal threshold (Youden):", round(relaxed_threshold, 4), "\n")
+cat("  Sensitivity at threshold:", round(relaxed_best_coords$sensitivity, 4), "\n")
+cat("  Specificity at threshold:", round(relaxed_best_coords$specificity, 4), "\n")
+
+# --- Predictions and confusion matrix at optimal threshold ---
+relaxed_pred_class <- ifelse(relaxed_pred_prob >= relaxed_threshold, 1, 0)
+
+relaxed_cm <- confusionMatrix(
+  factor(relaxed_pred_class, levels = c(0, 1)),
+  factor(y_test, levels = c(0, 1)),
+  positive = "1"
+)
+print(relaxed_cm)
+```
+The ROC curves compare the predictive performance of logistic regression, LASSO, and relaxed LASSO on the test set. Both LASSO and relaxed LASSO substantially outperform standard logistic regression, achieving an AUC of approximately 0.844 compared to 0.647. This indicates a much stronger ability to distinguish between serious and non-serious outcomes when incorporating high-dimensional predictors and variable selection.
+
+Notably, the ROC curves for LASSO and relaxed LASSO overlap almost perfectly, confirming that relaxing the shrinkage does not improve discrimination. In contrast, the logistic regression curve lies closer to the diagonal, indicating weaker predictive performance.
+
+In the context of predicting severe adverse drug reactions, these results demonstrate that regularization and variable selection significantly enhance the model’s ability to rank patients by risk, although, as seen previously, this improvement in discrimination does not translate into strong classification performance due to class imbalance.
+
+```{r model-comparison}
+# ============================================================
+# MODEL COMPARISON
+# ============================================================
+# We compare all three models on the held-out test set using four
+# metrics:
+#   AUC         — overall discriminative ability (threshold-free)
+#   Accuracy    — proportion of correct classifications at threshold 0.5
+#   Sensitivity — true positive rate: P(predicted serious | truly serious)
+#   Specificity — true negative rate: P(predicted not serious | truly not serious)
+#
+# In a pharmacovigilance context, SENSITIVITY is particularly important:
+# failing to flag a serious outcome (false negative) typically carries
+# higher clinical cost than a false alarm (false positive).
+
+comparison_df <- data.frame(
+  Model = c("Logistic Regression", "LASSO Logistic", "Relaxed LASSO"),
+  AUC = c(
+    round(auc(glm_roc),     4),
+    round(auc(lasso_roc),   4),
+    round(auc(relaxed_roc), 4)
+  ),
+  Accuracy = round(c(
+    glm_cm$overall["Accuracy"],
+    lasso_cm$overall["Accuracy"],
+    relaxed_cm$overall["Accuracy"]
+  ), 4),
+  Sensitivity = round(c(
+    glm_cm$byClass["Sensitivity"],
+    lasso_cm$byClass["Sensitivity"],
+    relaxed_cm$byClass["Sensitivity"]
+  ), 4),
+  Specificity = round(c(
+    glm_cm$byClass["Specificity"],
+    lasso_cm$byClass["Specificity"],
+    relaxed_cm$byClass["Specificity"]
+  ), 4)
+)
+
+knitr::kable(comparison_df,
+             caption = "Model Performance on Held-Out Test Set (threshold = 0.5)")
+
+# --- Overlaid ROC curves ---
+roc_data <- bind_rows(
+  data.frame(
+    FPR   = 1 - glm_roc$specificities,
+    TPR   = glm_roc$sensitivities,
+    Model = paste0("Logistic Regression (AUC = ",
+                   round(auc(glm_roc), 3), ")")
+  ),
+  data.frame(
+    FPR   = 1 - lasso_roc$specificities,
+    TPR   = lasso_roc$sensitivities,
+    Model = paste0("LASSO (AUC = ",
+                   round(auc(lasso_roc), 3), ")")
+  ),
+  data.frame(
+    FPR   = 1 - relaxed_roc$specificities,
+    TPR   = relaxed_roc$sensitivities,
+    Model = paste0("Relaxed LASSO (AUC = ",
+                   round(auc(relaxed_roc), 3), ")")
+  )
+)
+
+knitr::opts_chunk$set(dev = "png")
+
+ggplot(roc_data, aes(x = FPR, y = TPR, color = Model)) +
+  geom_line(linewidth = 1.2) +
+  geom_abline(slope = 1, intercept = 0,
+              linetype = "dashed", color = "gray60", linewidth = 0.8) +
+  scale_color_brewer(palette = "Set1") +
+  theme_bw(base_size = 12) +
+  labs(
+    title    = "ROC Curves — Model Comparison (Test Set)",
+    subtitle = "Dashed diagonal = random classifier (AUC = 0.5)",
+    x        = "False Positive Rate (1 − Specificity)",
+    y        = "True Positive Rate (Sensitivity)",
+    color    = NULL
+  ) +
+  theme(legend.position = "bottom")
+
+# --- Summary of findings ---
+# • Standard logistic regression uses the smallest predictor set and
+#   provides an interpretable odds-ratio baseline.
+# • LASSO logistic regression automatically selects the most predictive
+#   drug class and country features from a high-dimensional feature space,
+#   typically yielding a higher AUC than the baseline model.
+# • Relaxed LASSO retains LASSO's variable selection but removes the
+#   shrinkage bias on selected coefficients; it often achieves the
+#   highest AUC among the three and produces the most faithful
+#   coefficient estimates for clinical interpretation.
+# • Across all models, sensitivity is the critical metric for this
+#   application: a model that flags serious reactions with high recall
+#   is more clinically valuable than one that merely achieves high
+#   overall accuracy.
+```
+
+### Neural Networks
+
+Neural networks are useful here because the relationship between adverse event severity and its predictors is unlikely to be purely linear. For example, age may matter differently depending on the number of drugs a patient is taking. A drug class may look more dangerous in patients with many reactions than in patients with only one reaction. A neural network can learn these kinds of interactions without manually writing every interaction term.
+
+All three models answer the same prediction question. They differ only in complexity. This makes the comparison fair and easy to explain.
+
+```{r nn_setup, include=FALSE}
+required_packages <- c("caret", "pROC", "gridExtra", "keras3")
+
+#for (pkg in required_packages) {
+ # if (!requireNamespace(pkg, quietly = TRUE)) {
+  #  install.packages(pkg)
+#  }
+#}
+
+#library(caret)
+#library(pROC)
+#library(gridExtra)
+# library(keras3)
+
+set.seed(42)
+keras3::set_random_seed(42)
+
+# If TensorFlow is missing in a fresh Colab R runtime, run this once in a separate cell before knitting.
+# keras3::install_keras(backend = "tensorflow")
+```
+
+#### Data Preparation for Modeling
+
+The model uses the features that connect most directly to the EDA. These include report timing, number of reactions, number of drugs, patient age, patient weight, sex, age group, drug count group, suspect drug, brand name, drug indication, drug class, and drug route. Rare categorical values are grouped into an Other category so that the model focuses on common and stable patterns instead of memorizing thousands of rare labels.
+
+Country is intentionally excluded by default. This follows the modeling concern raised in the team discussion: country can capture reporting behavior instead of patient risk. Leaving it out makes the neural network more focused on patient and drug information.
+
+```{r nn_data_preparation, include=FALSE}
+nn_data <- data %>%
+  filter(!is.na(patient_age_years)) %>%
+  mutate(
+    serious_binary = ifelse(serious == "Yes", 1, 0),
+    patient_weight_kg = ifelse(
+      is.na(patient_weight_kg),
+      median(patient_weight_kg, na.rm = TRUE),
+      patient_weight_kg
+    )
+  )
+
+lump_top_n <- function(x, n = 50) {
+  x <- as.character(x)
+  x[is.na(x) | x == ""] <- "Unknown"
+  top_values <- names(sort(table(x), decreasing = TRUE))[1:min(n, length(unique(x)))]
+  ifelse(x %in% top_values, x, "Other")
+}
+
+encode_category <- function(x) {
+  x <- as.character(x)
+  x[is.na(x) | x == ""] <- "Unknown"
+  as.integer(factor(x)) - 1
+}
+
+nn_data <- nn_data %>%
+  mutate(
+    suspect_drug_lumped = lump_top_n(suspect_drug, 50),
+    brand_name_lumped = lump_top_n(brand_name, 50),
+    drug_indication_lumped = lump_top_n(drug_indication, 50),
+    pharm_class_lumped = lump_top_n(pharm_class, 50),
+    patient_sex_encoded = encode_category(patient_sex),
+    age_group_encoded = encode_category(age_group),
+    drug_count_category_encoded = encode_category(drug_count_category),
+    suspect_drug_encoded = encode_category(suspect_drug_lumped),
+    brand_name_encoded = encode_category(brand_name_lumped),
+    drug_indication_encoded = encode_category(drug_indication_lumped),
+    pharm_class_encoded = encode_category(pharm_class_lumped),
+    drug_route_encoded = encode_category(drug_route)
+  )
+
+feature_cols <- c(
+  "year",
+  "month",
+  "num_reactions",
+  "num_drugs",
+  "patient_age_years",
+  "patient_weight_kg",
+  "patient_sex_encoded",
+  "age_group_encoded",
+  "drug_count_category_encoded",
+  "suspect_drug_encoded",
+  "brand_name_encoded",
+  "drug_indication_encoded",
+  "pharm_class_encoded",
+  "drug_route_encoded"
+)
+
+x_matrix <- as.matrix(nn_data[, ..feature_cols])
+y_binary <- nn_data$serious_binary
+
+train_index <- caret::createDataPartition(y_binary, p = 0.80, list = FALSE)
+
+x_train <- x_matrix[train_index, ]
+x_test <- x_matrix[-train_index, ]
+y_train <- y_binary[train_index]
+y_test <- y_binary[-train_index]
+
+train_means <- colMeans(x_train, na.rm = TRUE)
+train_sds <- apply(x_train, 2, sd, na.rm = TRUE)
+train_sds[train_sds == 0 | is.na(train_sds)] <- 1
+
+x_train_scaled <- scale(x_train, center = train_means, scale = train_sds)
+x_test_scaled <- scale(x_test, center = train_means, scale = train_sds)
+
+x_train_scaled[is.na(x_train_scaled)] <- 0
+x_test_scaled[is.na(x_test_scaled)] <- 0
+```
+
+```{r nn_split_summary}
+split_summary <- data.frame(
+  Set = c("Training", "Testing"),
+  Reports = c(nrow(x_train_scaled), nrow(x_test_scaled)),
+  Serious_Rate = c(mean(y_train), mean(y_test))
+)
+
+split_summary %>%
+  mutate(
+    Reports = comma(Reports),
+    Serious_Rate = percent(Serious_Rate, accuracy = 0.1)
+  ) %>%
+  knitr::kable(
+    col.names = c("Set", "Reports", "Serious outcome rate"),
+    caption = "The train and test sets keep similar serious outcome rates. This helps make the evaluation fair."
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+```
+
+#### How the Three Models Work
+
+Model 1 is the baseline shallow neural network. It has two hidden layers. Its job is to answer a simple question: can a basic neural network learn useful signal from the variables identified in the EDA?
+
+Model 2 is the deep dense neural network. It uses more layers, batch normalization, dropout, and regularization. Its job is to test whether a deeper model can learn more complex relationships, such as age interacting with polypharmacy or drug class interacting with number of reactions.
+
+Model 3 is the wide and deep neural network. It starts with larger hidden layers, which gives it more capacity to learn broader patterns. Strong dropout is used so the larger model does not simply memorize the training data.
+
+Each model outputs a probability between 0 and 1. A value closer to 1 means the model thinks the report is more likely to be serious. The final class is assigned using a 0.50 threshold.
+
+```{r nn_helper_functions, include=FALSE, results = FALSE}
+evaluate_binary_model <- function(model, x_test_scaled, y_test, model_name) {
+  predicted_prob <- as.numeric(predict(model, x_test_scaled, verbose = 0))
+  predicted_class <- ifelse(predicted_prob >= 0.50, 1, 0)
+
+  true_positive <- sum(predicted_class == 1 & y_test == 1)
+  true_negative <- sum(predicted_class == 0 & y_test == 0)
+  false_positive <- sum(predicted_class == 1 & y_test == 0)
+  false_negative <- sum(predicted_class == 0 & y_test == 1)
+
+  accuracy <- mean(predicted_class == y_test)
+  precision <- ifelse(true_positive + false_positive == 0, NA_real_,
+                      true_positive / (true_positive + false_positive))
+  recall <- ifelse(true_positive + false_negative == 0, NA_real_,
+                   true_positive / (true_positive + false_negative))
+  f1 <- ifelse(is.na(precision) | is.na(recall) | precision + recall == 0, NA_real_,
+               2 * precision * recall / (precision + recall))
+
+  roc_object <- pROC::roc(y_test, predicted_prob, quiet = TRUE)
+  auc_value <- as.numeric(pROC::auc(roc_object))
+
+  list(
+    metrics = data.frame(
+      Model = model_name,
+      AUC = auc_value,
+      Accuracy = accuracy,
+      Precision = precision,
+      Recall = recall,
+      F1 = f1
+    ),
+    predictions = data.frame(
+      Model = model_name,
+      Actual = factor(ifelse(y_test == 1, "Serious", "Not serious"),
+                      levels = c("Not serious", "Serious")),
+      Actual_Numeric = y_test,
+      Predicted_Class = factor(ifelse(predicted_class == 1, "Serious", "Not serious"),
+                               levels = c("Not serious", "Serious")),
+      Predicted_Probability = predicted_prob
+    )
+  )
+}
+
+history_to_data_frame <- function(history, model_name) {
+  metric_names <- names(history$metrics)
+  n_epochs <- length(history$metrics$loss)
+
+  get_metric <- function(metric_name) {
+    if (metric_name %in% metric_names) {
+      history$metrics[[metric_name]]
+    } else {
+      rep(NA_real_, n_epochs)
+    }
+  }
+
+  data.frame(
+    Model = model_name,
+    Epoch = seq_len(n_epochs),
+    Training_Loss = get_metric("loss"),
+    Validation_Loss = get_metric("val_loss"),
+    Training_Accuracy = get_metric("accuracy"),
+    Validation_Accuracy = get_metric("val_accuracy")
+  )
+}
+
+compact_test_summary <- function(result_object, history_object) {
+  metrics <- result_object$metrics
+  predictions <- result_object$predictions
+  n_epochs_run <- length(history_object$metrics$loss)
+
+  data.frame(
+    `Epochs run` = n_epochs_run,
+    `Test AUC` = round(metrics$AUC, 4),
+    `Test accuracy` = round(metrics$Accuracy, 4),
+    `Test precision` = round(metrics$Precision, 4),
+    `Test recall` = round(metrics$Recall, 4),
+    `Test F1` = round(metrics$F1, 4),
+    `Test reports` = nrow(predictions),
+    check.names = FALSE
+  )
+}
+
+compact_confusion_summary <- function(result_object) {
+  result_object$predictions %>%
+    count(Actual, Predicted_Class) %>%
+    group_by(Actual) %>%
+    mutate(`Row percent` = percent(n / sum(n), accuracy = 0.1)) %>%
+    ungroup() %>%
+    rename(`Actual outcome` = Actual,
+           `Predicted outcome` = Predicted_Class,
+           `Number of reports` = n)
+}
+
+make_callbacks <- function() {
+  list(
+    callback_early_stopping(
+      monitor = "val_loss",
+      patience = 15,
+      restore_best_weights = TRUE
+    ),
+    callback_reduce_lr_on_plateau(
+      monitor = "val_loss",
+      patience = 7,
+      factor = 0.50
+    )
+  )
+}
+
+epochs_nn <- 100
+batch_size_nn <- 512
+```
+
+### Model 1: Baseline Shallow Neural Network
+
+The baseline model is intentionally simple. It gives the project a fair starting point before moving to deeper models. If this model performs well, it means the main predictors from the EDA already contain strong signal.
+
+```{r nn_model_1, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+if (file.exists('model_baseline.keras')) {
+  model_baseline <- load_model('model_baseline.keras')
+  history_baseline <- readRDS('history_baseline.rds')
+  message("Model loaded from file")
+} else {
+    model_baseline <- keras_model_sequential(input_shape = ncol(x_train_scaled)) %>%
+  layer_dense(units = 100, activation = "relu", name = "hidden_layer_1") %>%
+  layer_dropout(rate = 0.30, name = "dropout_1") %>%
+  layer_dense(units = 50, activation = "relu", name = "hidden_layer_2") %>%
+  layer_dropout(rate = 0.20, name = "dropout_2") %>%
+  layer_dense(units = 1, activation = "sigmoid", name = "output_layer")
+
+model_baseline %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+
+history_baseline <- model_baseline %>% fit(
+  x = x_train_scaled,
+  y = y_train,
+  epochs = epochs_nn,
+  batch_size = batch_size_nn,
+  validation_split = 0.20,
+  callbacks = make_callbacks(),
+  verbose = 0
+)
+
+  save_model(model_baseline, 'model_baseline.keras')
+  saveRDS(history_baseline, 'history_baseline.rds')
+  message("Model and history trained and saved to disk.")
+}
+
+result_baseline <- evaluate_binary_model(
+  model = model_baseline,
+  x_test_scaled = x_test_scaled,
+  y_test = y_test,
+  model_name = "Baseline shallow neural network"
+)
+```
+
+The training code is shown above because it is the main modeling step. The model trains for up to 100 epochs, but the epoch by epoch output is hidden with `verbose = 0` so the report stays readable. Early stopping keeps the best validation version of the model.
+
+```{r nn_model_1_test_summary}
+compact_test_summary(result_baseline, history_baseline) %>%
+  knitr::kable(
+    caption = "Baseline neural network test set results"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+```
+
+```{r nn_model_1_confusion_summary}
+compact_confusion_summary(result_baseline) %>%
+  knitr::kable(
+    caption = "Baseline neural network test set classification counts"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+```
+
+### Model 2: Deep Dense Neural Network
+
+The second model is deeper. It is designed to learn layered patterns in the data. Early layers can learn broad patterns such as whether a report looks high risk overall. Later layers can combine those patterns into more specific signals, such as older age plus many drugs plus a high risk drug class.
+
+```{r nn_model_2, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+
+if (file.exists('model_deep.keras')) {
+  model_deep <- load_model('model_deep.keras')
+  history_deep <- readRDS('history_deep.rds')
+  message("Model loaded from file.")
+} else{
+model_deep <- keras_model_sequential(input_shape = ncol(x_train_scaled)) %>%
+  layer_dense(
+    units = 256,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.001),
+    name = "dense_layer_1"
+  ) %>%
+  layer_batch_normalization(name = "batch_norm_1") %>%
+  layer_dropout(rate = 0.40, name = "dropout_1") %>%
+  layer_dense(
+    units = 128,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.001),
+    name = "dense_layer_2"
+  ) %>%
+  layer_batch_normalization(name = "batch_norm_2") %>%
+  layer_dropout(rate = 0.40, name = "dropout_2") %>%
+  layer_dense(
+    units = 64,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.001),
+    name = "dense_layer_3"
+  ) %>%
+  layer_batch_normalization(name = "batch_norm_3") %>%
+  layer_dropout(rate = 0.30, name = "dropout_3") %>%
+  layer_dense(units = 32, activation = "relu", name = "dense_layer_4") %>%
+  layer_dropout(rate = 0.20, name = "dropout_4") %>%
+  layer_dense(units = 1, activation = "sigmoid", name = "output_layer")
+
+model_deep %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+
+history_deep <- model_deep %>% fit(
+  x = x_train_scaled,
+  y = y_train,
+  epochs = epochs_nn,
+  batch_size = batch_size_nn,
+  validation_split = 0.20,
+  callbacks = make_callbacks(),
+  verbose = 0
+)
+
+save_model(model_deep, 'model_deep.keras')
+saveRDS(history_deep, 'history_deep.rds')
+message("Model and history saved to disk.")
+}
+
+result_deep <- evaluate_binary_model(
+  model = model_deep,
+  x_test_scaled = x_test_scaled,
+  y_test = y_test,
+  model_name = "Deep dense neural network"
+)
+```
+
+This model uses more layers than the baseline, so the point is not just to get a prediction. The point is to check whether added depth improves test performance after regularization and early stopping.
+
+```{r nn_model_2_test_summary}
+compact_test_summary(result_deep, history_deep) %>%
+  knitr::kable(
+    caption = "Deep dense neural network test set results"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+```
+
+```{r nn_model_2_confusion_summary}
+compact_confusion_summary(result_deep) %>%
+  knitr::kable(
+    caption = "Deep dense neural network test set classification counts"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+```
+
+### Model 3: Wide and Deep Neural Network
+
+The third model gives the neural network more capacity at the beginning. This helps it search through many possible combinations of predictors. Dropout and regularization are included to keep the model from becoming too dependent on any one feature.
+
+```{r nn_model_3, echo=TRUE, results='hide', message=FALSE, warning=FALSE}
+
+if (file.exists('model_wide_deep.keras')) {
+  model_wide_deep <- load_model('model_wide_deep.keras')
+  history_wide_deep <- readRDS('history_wide_deep.rds')
+  message('Model loaded from file.')
+} else {
+model_wide_deep <- keras_model_sequential(input_shape = ncol(x_train_scaled)) %>%
+  layer_dense(
+    units = 512,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.001),
+    name = "wide_layer_1"
+  ) %>%
+  layer_batch_normalization(name = "batch_norm_1") %>%
+  layer_dropout(rate = 0.50, name = "dropout_1") %>%
+  layer_dense(
+    units = 256,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.001),
+    name = "wide_layer_2"
+  ) %>%
+  layer_batch_normalization(name = "batch_norm_2") %>%
+  layer_dropout(rate = 0.40, name = "dropout_2") %>%
+  layer_dense(
+    units = 128,
+    activation = "relu",
+    kernel_regularizer = regularizer_l2(0.001),
+    name = "deep_layer_3"
+  ) %>%
+  layer_batch_normalization(name = "batch_norm_3") %>%
+  layer_dropout(rate = 0.30, name = "dropout_3") %>%
+  layer_dense(units = 1, activation = "sigmoid", name = "output_layer")
+
+model_wide_deep %>% compile(
+  optimizer = optimizer_adam(learning_rate = 0.001),
+  loss = "binary_crossentropy",
+  metrics = c("accuracy")
+)
+
+history_wide_deep <- model_wide_deep %>% fit(
+  x = x_train_scaled,
+  y = y_train,
+  epochs = epochs_nn,
+  batch_size = batch_size_nn,
+  validation_split = 0.20,
+  callbacks = make_callbacks(),
+  verbose = 0
+)
+
+save_model(model_wide_deep, 'model_wide_deep.keras')
+saveRDS(history_wide_deep, 'history_wide_deep.rds')
+message('Model trained and saved to disk.')
+
+}
+
+result_wide_deep <- evaluate_binary_model(
+  model = model_wide_deep,
+  x_test_scaled = x_test_scaled,
+  y_test = y_test,
+  model_name = "Wide and deep neural network"
+)
+```
+
+This model has the most capacity of the three. It is useful only if the larger architecture improves performance on the test set, not just on the training data. That is why the test set metrics are shown directly below.
+
+```{r nn_model_3_test_summary}
+compact_test_summary(result_wide_deep, history_wide_deep) %>%
+  knitr::kable(
+    caption = "Wide and deep neural network test set results"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+```
+
+```{r nn_model_3_confusion_summary}
+compact_confusion_summary(result_wide_deep) %>%
+  knitr::kable(
+    caption = "Wide and deep neural network test set classification counts"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  )
+```
+
+### Model Performance
+
+The table below summarizes the test set results. AUC is the most important metric here because it measures how well the model ranks serious reports above reports that are not serious. Accuracy is also shown, but it can be less informative when serious outcomes are common in the dataset.
+
+```{r nn_model_comparison_table}
+comparison_results <- bind_rows(
+  result_baseline$metrics,
+  result_deep$metrics,
+  result_wide_deep$metrics
+) %>%
+  mutate(
+    Architecture = c(
+      "Input to 100 to 50 to 1",
+      "Input to 256 to 128 to 64 to 32 to 1",
+      "Input to 512 to 256 to 128 to 1"
+    )
+  ) %>%
+  select(Model, Architecture, AUC, Accuracy, Precision, Recall, F1)
+
+comparison_results %>%
+  mutate(across(c(AUC, Accuracy, Precision, Recall, F1), ~ round(.x, 4))) %>%
+  knitr::kable(
+    caption = "Test set performance for the three neural network models"
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>%
+  kableExtra::column_spec(1, bold = TRUE)
+```
+
+```{r nn_model_comparison_plot, fig.height=5.6, fig.width=10}
+comparison_long <- comparison_results %>%
+  select(Model, AUC, Accuracy, F1) %>%
+  pivot_longer(
+    cols = c(AUC, Accuracy, F1),
+    names_to = "Metric",
+    values_to = "Value"
+  )
+
+ggplot(comparison_long, aes(x = reorder(Model, Value), y = Value, fill = Metric)) +
+  geom_col(position = position_dodge(width = 0.75), width = 0.65, alpha = 0.92) +
+  geom_text(
+    aes(label = round(Value, 3)),
+    position = position_dodge(width = 0.75),
+    vjust = -0.35,
+    size = 3.5,
+    color = "grey20"
+  ) +
+  coord_cartesian(ylim = c(0, 1)) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  theme(
+    axis.text.x = element_text(angle = 15, hjust = 1),
+    legend.title = element_blank()
+  ) +
+  labs(
+    x = NULL,
+    y = "Metric value",
+    title = "Model Performance on the Same Test Set",
+    subtitle = "AUC evaluates ranking quality, while accuracy and F1 summarize classification at the 0.50 threshold"
+  )
+```
+
+## ROC Curve Comparison
+
+The ROC curve shows how well each model separates serious reports from reports that are not serious across all possible thresholds. Curves closer to the upper left corner indicate stronger ranking performance.
+
+```{r nn_roc_curves, fig.height=6, fig.width=9.5}
+prediction_all <- bind_rows(
+  result_baseline$predictions,
+  result_deep$predictions,
+  result_wide_deep$predictions
+)
+
+roc_data <- prediction_all %>%
+  group_by(Model) %>%
+  group_modify(~ {
+    roc_object <- pROC::roc(.x$Actual_Numeric, .x$Predicted_Probability, quiet = TRUE)
+    roc_coords <- pROC::coords(
+      roc_object,
+      x = "all",
+      ret = c("specificity", "sensitivity"),
+      transpose = FALSE
+    )
+    data.frame(
+      False_Positive_Rate = 1 - roc_coords$specificity,
+      True_Positive_Rate = roc_coords$sensitivity
+    )
+  }) %>%
+  ungroup()
+
+auc_labels <- comparison_results %>%
+  transmute(Model, Label = paste0(Model, " AUC ", round(AUC, 4)))
+
+ggplot(roc_data, aes(x = False_Positive_Rate, y = True_Positive_Rate, color = Model)) +
+  geom_line(linewidth = 1.15) +
+  geom_abline(linetype = "dashed", color = "grey60") +
+  scale_color_brewer(palette = "Dark2", labels = auc_labels$Label) +
+  coord_equal() +
+  theme(legend.title = element_blank()) +
+  labs(
+    x = "False positive rate",
+    y = "True positive rate",
+    title = "ROC Curves for Serious Outcome Prediction",
+    subtitle = "Higher curves mean stronger separation between serious and not serious reports"
+  )
+```
+
+## Prediction Separation for the Best Model
+
+The next plot uses the model with the highest AUC. It shows whether predicted probabilities are meaningfully different for serious and not serious reports. Ideally, serious reports should be shifted toward higher predicted probabilities.
+
+```{r nn_best_model_setup, include=FALSE}
+best_model_name <- comparison_results %>%
+  arrange(desc(AUC)) %>%
+  slice(1) %>%
+  pull(Model)
+
+best_model <- switch(
+  best_model_name,
+  "Baseline shallow neural network" = model_baseline,
+  "Deep dense neural network" = model_deep,
+  "Wide and deep neural network" = model_wide_deep
+)
+
+best_predictions <- prediction_all %>%
+  filter(Model == best_model_name)
+```
+
+```{r nn_probability_distribution, fig.height=5.6, fig.width=9.5}
+ggplot(best_predictions, aes(x = Predicted_Probability, fill = Actual)) +
+  geom_density(alpha = 0.45, linewidth = 0.8) +
+  scale_x_continuous(labels = percent_format(accuracy = 1), limits = c(0, 1)) +
+  scale_fill_brewer(palette = "Set2") +
+  theme(legend.title = element_blank()) +
+  labs(
+    x = "Predicted probability of a serious outcome",
+    y = "Density",
+    title = paste("Prediction Separation for", best_model_name),
+    subtitle = "Serious reports should generally receive higher predicted probabilities"
+  )
+```
+
+## Confusion Matrix for the Best Model
+
+The confusion matrix shows the practical classification result when the predicted probability is converted into a class using a 0.50 threshold.
+
+```{r nn_confusion_matrix_best, fig.height=5.2, fig.width=7}
+confusion_df <- best_predictions %>%
+  count(Actual, Predicted_Class) %>%
+  group_by(Actual) %>%
+  mutate(Row_Percent = n / sum(n)) %>%
+  ungroup()
+
+ggplot(confusion_df, aes(x = Predicted_Class, y = Actual, fill = Row_Percent)) +
+  geom_tile(color = "white", linewidth = 1.2) +
+  geom_text(
+    aes(label = paste0(comma(n), "\n", percent(Row_Percent, accuracy = 0.1))),
+    size = 4.2,
+    color = "grey15",
+    lineheight = 0.95
+  ) +
+  scale_fill_gradient(
+    low = "#c6dbef",   # light blue (low values)
+    high = "#de2d26",  # red (high values)
+    labels = percent_format(accuracy = 1)
+  ) +
+  theme(
+    panel.grid = element_blank(),
+    legend.position = "right"
+  ) +
+  labs(
+    x = "Predicted class",
+    y = "Actual class",
+    fill = "Row percent",
+    title = paste("Confusion Matrix for", best_model_name),
+    subtitle = "Each cell shows the number of reports and the row percentage"
+  )
+``` 
+
+```{r nn_best_model_metrics, results='show'}
+cm_best <- confusionMatrix(
+  factor(ifelse(best_predictions$Predicted_Class == "Serious", 1, 0), levels = c(0, 1)),
+  factor(best_predictions$Actual_Numeric, levels = c(0, 1)),
+  positive = "1"
+)
+
+data.frame(
+  Metric = c(
+    "Accuracy",
+    "Sensitivity (Recall)",
+    "Specificity",
+    "Precision (PPV)",
+    "Negative Predictive Value",
+    "F1 Score",
+    "Balanced Accuracy",
+    "AUC"
+  ),
+  Value = round(c(
+    cm_best$overall["Accuracy"],
+    cm_best$byClass["Sensitivity"],
+    cm_best$byClass["Specificity"],
+    cm_best$byClass["Pos Pred Value"],
+    cm_best$byClass["Neg Pred Value"],
+    cm_best$byClass["F1"],
+    cm_best$byClass["Balanced Accuracy"],
+    as.numeric(pROC::auc(pROC::roc(
+      best_predictions$Actual_Numeric,
+      best_predictions$Predicted_Probability,
+      quiet = TRUE
+    )))
+  ), 4)
+) %>%
+  knitr::kable(
+    caption = paste("Full Classification Metrics —", best_model_name),
+    col.names = c("Metric", "Value")
+  ) %>%
+  kableExtra::kable_styling(
+    bootstrap_options = c("striped", "hover", "condensed"),
+    full_width = FALSE
+  ) %>%
+  kableExtra::row_spec(
+    c(2, 8),
+    bold = TRUE,
+    background = "#FFF3CD"
+  )
+```
+## Which Inputs Matter Most?
+
+Neural networks do not give coefficients like logistic regression. To make the model easier to interpret, the plot below uses permutation importance. Each feature is shuffled one at a time in the test set. If shuffling a feature causes a large drop in AUC, that feature was important for the model.
+
+```{r nn_permutation_importance, fig.height=6, fig.width=9.5}
+set.seed(42)
+importance_n <- min(12000, nrow(x_test_scaled))
+importance_index <- sample(seq_len(nrow(x_test_scaled)), importance_n)
+
+x_importance <- x_test_scaled[importance_index, , drop = FALSE]
+y_importance <- y_test[importance_index]
+
+base_prob <- as.numeric(predict(best_model, x_importance, verbose = 0))
+base_auc <- as.numeric(pROC::auc(pROC::roc(y_importance, base_prob, quiet = TRUE)))
+
+importance_results <- map_dfr(seq_along(feature_cols), function(j) {
+  x_perm <- x_importance
+  x_perm[, j] <- sample(x_perm[, j])
+  perm_prob <- as.numeric(predict(best_model, x_perm, verbose = 0))
+  perm_auc <- as.numeric(pROC::auc(pROC::roc(y_importance, perm_prob, quiet = TRUE)))
+  data.frame(
+    Feature = feature_cols[j],
+    AUC_Drop = base_auc - perm_auc
+  )
+}) %>%
+  arrange(desc(AUC_Drop)) %>%
+  slice_head(n = 10) %>%
+  mutate(
+    Feature = recode(
+      Feature,
+      year = "Report year",
+      month = "Report month",
+      num_reactions = "Number of reactions",
+      num_drugs = "Number of drugs",
+      patient_age_years = "Patient age",
+      patient_weight_kg = "Patient weight",
+      patient_sex_encoded = "Patient sex",
+      age_group_encoded = "Age group",
+      drug_count_category_encoded = "Drug count group",
+      suspect_drug_encoded = "Suspect drug",
+      brand_name_encoded = "Brand name",
+      drug_indication_encoded = "Drug indication",
+      pharm_class_encoded = "Drug class",
+      drug_route_encoded = "Drug route"
+    )
+  )
+
+ggplot(importance_results, aes(x = reorder(Feature, AUC_Drop), y = AUC_Drop)) +
+  geom_col(width = 0.72, fill = "#2C7FB8", alpha = 0.88) +
+  geom_text(aes(label = round(AUC_Drop, 4)), hjust = -0.15, size = 3.5, color = "grey20") +
+  coord_flip() +
+  scale_y_continuous(expand = expansion(mult = c(0, 0.12))) +
+  labs(
+    x = NULL,
+    y = "Drop in AUC after shuffling",
+    title = paste("Most Important Inputs for", best_model_name),
+    subtitle = "Larger drops mean the model relied more on that feature"
+  )
+```
+
+
+### Classification with Extreme Gradient Boosting (XGBoost)
+
+```{r train test split}
+set.seed(1)
+data_train <- data %>% sample_frac(.8)
+data_test <- anti_join(data, data_train)
+data_test_serious <- pull(data_test, serious)
+```
+
+Our next model will be using **extreme gradient boosting** (XGBoost), a tree-based method that sequentially builds and compares trees. Unlike random forest, XGBoost can natively handle NA values, using missingness as another source of predictive information. This makes it an excellent candidate for our messy dataset as it does not require us to drop any observations.
+
+We will use AUC as our classifier criterion because (1) it is better able to handle the class imbalance in our dataset between serious and non-serious reactions and (2) since we are predicting whether a reaction is serious, not the severity, so we do not care about the probability of a serious reaction as much as whether one will occur. We also scale the hyper-parameter scale_pos_weight to better deal with the unequal split between serious/non-serious cases. We proceed with cross-validation of the boosted fit to determine the ideal number of rounds without overfitting.
+
+Our first model included country as a predictor, but we found that due to imbalanced training data, the model used country as its single strongest predictor. The proportion of serious reactions was significantly higher for non-US relative to US patients, so we decided to remove country from the model. The data likely contained more serious reactions abroad because it is FDA-managed and primarily contains reports from American providers and patients; a drug reaction would have to be very serious while abroad to justify reporting. We show the fit with country in the Appendix.
+
+We will proceed by **removing country** as a predictor to see whether boosting yields an accurate model without the effects of over-representation from a single country. We first show a naive fit below:
+
+```{r}
+
+set.seed(1)
+
+# set up data subset, without country
+
+data2_train <- data_train %>% dplyr::select(year, month, serious, num_reactions, num_drugs, suspect_drug, brand_name, drug_indication, pharm_class, patient_age_years, patient_sex, patient_weight_kg, drug_route_label)
+
+data2_test <- data_test %>% dplyr::select(year, month, serious, num_reactions, num_drugs, suspect_drug, brand_name, drug_indication, pharm_class, patient_age_years, patient_sex, patient_weight_kg, drug_route_label)
+
+# build DMatrices
+
+options(na.action = "na.pass")
+
+# train
+X_train2 <- sparse.model.matrix(serious ~ . - 1, data = data2_train)
+labels2 <- as.numeric(data2_train$serious) - 1
+nrow(X_train2) == length(labels2)
+
+dtrain2 <- xgb.DMatrix(data = X_train2, label = labels2, missing = NA)
+
+# test
+X_test2 <- sparse.model.matrix(serious ~ . - 1, data = data2_test)
+labels2_test <- as.numeric(data2_test$serious) - 1
+nrow(X_test2) == length(labels2_test)
+
+dtest2 <- xgb.DMatrix(data = X_test2, label = labels2_test, missing = NA)
+```
+
+
+```{r}
+
+# define hyperparameters
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6,
+  min_child_weight = 1, 
+  gamma = 0,            
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  scale_pos_weight = sum(labels2 == 0) / sum(labels2 == 1)
+)
+
+set.seed(1)
+
+# build first (naive) fit without country
+xgb.fit2 <- xgb.train(
+  params = params,
+  data = dtrain2,
+  nrounds = 500,
+  verbose = 0,
+  evals = list(train = dtrain2, test = dtest2)
+)
+
+# classifier
+pred_prob2 <- predict(xgb.fit2, dtest2)
+pred_class2 <- ifelse(pred_prob2 > 0.5, 1, 0)
+mean(pred_class2 == (as.numeric(data2_test$serious) - 1)) # 0.767
+
+# roc curve
+roc_boost2 <- roc(data2_test$serious, pred_prob2)
+plot(roc_boost2, 
+     main = "XGBoost ROC Curve without Country" , 
+     col = "blue", 
+     lwd = 2, 
+     print.auc = TRUE) 
+
+pred_class2 <- factor(pred_class2, levels = c(0,1), labels = c("No", "Yes"))
+confusionMatrix(pred_class2, data2_test$serious)
+```
+
+We report an AUC of 0.851 and a testing accuracy of 0.767. The model has a more balanced sensitivity/specificity, with sensitivity = 0.748 and specificity = 0.733. It has a significantly higher positive prediction value than negative (0.528 vs. 0.900), suggesting that it makes more errors when guessing that a reaction is not serious and few errors when it is. Generally, this means **we can be more sure when the model predicts a serious outcome than a non-serious one**. 
+
+```{r}
+
+# define hyperparameters
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6,
+  min_child_weight = 1, 
+  gamma = 0,            
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  scale_pos_weight = sum(labels2 == 0) / sum(labels2 == 1)
+)
+
+set.seed(1)
+
+# cross validation
+cv <- xgb.cv(
+  params = params,
+  data = dtrain2,
+  nrounds = 500,
+  nfold = 5,
+  stratified = TRUE,
+  early_stopping_rounds = 20,
+  maximize = TRUE
+)
+```
+
+We proceed with cross-validation to select the optimal number of rounds. Stopping isn't triggered because the training and test AUC continue to increase with each round. We will cut the model off at **500 rounds** since it reached a **training AUC of 0.917** and **testing AUC of 0.910**.
+
+```{r}
+
+set.seed(1)
+
+# final model without country
+final_xgb_2 <- xgb.train(
+  params = params,
+  data = dtrain2,
+  nrounds = 500
+)
+
+# classifier
+pred_prob_final2 <- predict(final_xgb_2, dtest2)
+pred_class_final2 <- ifelse(pred_prob_final2 > 0.5, 1, 0)
+mean(pred_class_final2 == (as.numeric(data2_test$serious) - 1)) # 0.767
+
+# roc curve
+roc_boost_final2 <- roc(data2_test$serious, pred_prob_final2)
+plot(roc_boost_final2, 
+     main = "Final XGBoost ROC Curve, without Country", 
+     col = "blue", 
+     lwd = 2, 
+     print.auc = TRUE) 
+
+```
+
+```{r, results = TRUE}
+
+# important predictors
+importance2_f <- xgb.importance(model = final_xgb_2)
+knitr::kable(head(importance2_f, 15),
+             caption = "Most Important Features in Boosted Model, without Country") %>% kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+# plot a representative tree (first one)
+# xgb.plot.tree(model = final_xgb_2, trees = 0)
+
+pred_class_final2 <- factor(pred_class_final2, levels = c(0,1), labels = c("No", "Yes"))
+
+# visualize confusion matrix
+
+confusionMatrix(pred_class_final2, data2_test$serious)
+
+#ggplot(as.data.frame(confusionMatrix(pred_class_final2, data_test_subset$serious)$table), aes(Reference, Prediction, fill = Freq)) +
+#  geom_tile() +
+ # geom_text(aes(label = Freq), color = "white") +
+  #theme_minimal() +
+#  theme(legend.position = "none") +
+ # labs(title = "Confusion Matrix for Boosted Fit 2")
+```
+
+Without country as a predictor, the most important predictors for whether a patient will have a serious outcome are **the number of drugs taken by the patient** and **the number of reported reactions to the medication**. We also see that **year of report, patient age, and month** are important - the decisions based on year and month could be due to seasonal trends or changes in the types of drugs being reported year-over-year. Interestingly, suspectDrugOther being important shows that there are rarely reported drugs associated with serious reactions. Many of the significant variables are `unknown' levels of various factors (drug_indication, drug_route_label, patient_sex, and brand_name), an effect of the model over-fitting to noise within the Unknown reports.
+
+We report a sensitivity of 0.742, specificity of 0.775, positive prediction rate of 0.528, and negative prediction rate of 0.899. This suggests that the model has a **better rate of predicting positive and negative results than previous models**, but still has trouble predicting **non-serious reactions**. It is excellent at classifying serious predictions.
+
+Notably, intramuscularly administered drugs also have a higher rate of serious reactions, confirming findings from our previous EDA.
+
+## Discussion
+
+The overall best model for prediction, as determined by AUC, interpretability, and accuracy, is the **logistic LASSO model**.The LASSO model has higher interpretability and is less prone to overfitting than neural network and boosted models, but lacks classification ability, likely due to imbalanced data split. We recommend the **boosted model** for classification since it has the highest AUC and a relatively balanced sensitivity and specificity, meaning it is not over-predicting serious reactions.
+
+### Logistic Models
+
+The logistic regression model had poor performance as a classifier (AUC = 0.647), over-predicting that a reaction would be serious (sensitivity = 1) and completely under-predicting that a reaction is not serious (specificity = 0), likely due to removing high-cardinality factor predictors. The logistic LASSO model showed strong improvement due to a sparser set of predictor parameters (AUC = 0.849) but still showed a poor specificity of 0.00833, with little improvement in the relaxed LASSO. 
+
+### Neural Network Models
+
+The neural network analyses directly followed from EDA, investigating whether severity is related to patient age, polypharmacy, number of reactions, drug identity, drug class, and route.
+
+The baseline model asks whether a simple neural network is enough. The deeper model asks whether more layers improve the ability to capture interactions. The wide and deep model asks whether a larger network can capture broader patterns without overfitting. Together, the three models show whether extra model complexity actually helps or whether the main signal is already captured by the basic features. The best neural network model was the **deep and wide model** which obtained an AUC of 0.881, sensitivity = 0.952, and specificity = 0.494. However, when considering system resources, the deep and wide model had the most trainable parameters and took the longest to run with only modest improvements to classification ability.
+
+### Boosted Models
+
+The boosted models were a robust way to analyze the dataset without excessive cleaning. The implementation required detailed EDA to explore the effects of different predictors on the probability of a serious outcome; for example, we found that the model over-fit to country and had to re-build without country as a predictor. Tree-based models tend to exploit patterns in data that may not be representative of the overall population which should be kept in mind while modeling. Notably, the boosted model did not include drug identity and route as predictors because they required outside data to correctly process which was not obtained until after the model was built. Future work should include these predictors to determine if they increase predictive power or change the importance rankings among predictors. The most important variables in the model were **number of drugs taken by the patient** and **number of reported reactions**, suggesting that providers should be prudent in checking adverse reactions to medications and be conservative with prescriptions in order to minimize adverse reaction rate. 
+
+## Conclusion
+
+The results should also be interpreted carefully. FAERS is a reporting database, not a controlled clinical trial. A model can identify patterns in reported adverse events, but it cannot prove that a drug caused an outcome. The best use of this model is risk screening and pattern recognition, not clinical diagnosis. Future work may re-fit the boosted model on different predictor variables like drug route, which required supplementary data that was not available when the model was first fit.
+
+## Appendices
+
+### EDA
+
+#### Age
+
+The first question we explore is whether patient age is associated with both the *volume* of adverse event reports and their *severity*. These are two different things — a group can generate many reports without necessarily having the worst outcomes.
+
+```{r age-count, fig.height = 5.5}
+age_palette <- c(
+  "Infant(0-2)"       = "#E8F5E9",
+  "Child(3-12)"       = "#A5D6A7",
+  "Teen(13-18)"       = "#66BB6A",
+  "Adult(19-40)"      = "#FFF176",
+  "Middle-Aged(41-65)"= "#FFB74D",
+  "Senior(66-80)"     = "#EF9A9A",
+  "Elderly(81+)"      = "#E53935",
+  "Unknown"           = "#CFD8DC"
+)
+
+data %>%
+  group_by(age_group) %>%
+  summarise(n = n()) %>%
+  mutate(label = comma(n)) %>%
+  ggplot(aes(x = age_group, y = n, fill = age_group)) +
+  geom_col(width = 0.72, show.legend = FALSE) +
+  geom_text(aes(label = label), vjust = -0.4, size = 3.6, color = "grey30") +
+  scale_fill_manual(values = age_palette) +
+  scale_y_continuous(labels = comma, expand = expansion(mult = c(0, 0.12))) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    axis.text.x   = element_text(angle = 30, hjust = 1),
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(
+    x        = NULL,
+    y        = "Number of Reports",
+    title    = "Who Is Being Reported On? Report Volume by Age Group",
+    subtitle = "Middle-aged adults dominate the dataset by a wide margin"
+  )
+```
+
+The dataset is dominated by middle-aged adults (41–65), who account for 166,278 reports — more than the next two age groups combined. This reflects both their large share of the population on prescription medications and the higher burden of chronic disease in that age range. Notably, 152,337 reports have unknown patient age, the second-largest "group" in the dataset, which will need careful handling during modelling.
+
+```{r age-rate, fig.height = 5.5}
+data %>%
+  filter(age_group != "Unknown") %>%
+  group_by(age_group) %>%
+  summarise(n = n(), serious_rate = mean(serious == "Yes")) %>%
+  mutate(
+    label = paste0(percent(serious_rate, accuracy = 0.1),
+                   "\n(n=", comma(n), ")")
+  ) %>%
+  ggplot(aes(x = age_group, y = serious_rate, fill = age_group)) +
+  geom_col(width = 0.72, show.legend = FALSE) +
+  geom_text(aes(label = label), vjust = -0.3, size = 3.3, lineheight = 1.1,
+            color = "grey30") +
+  scale_fill_manual(values = age_palette) +
+  scale_y_continuous(labels = percent, limits = c(0, 1.08),
+                     expand = c(0, 0)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    axis.text.x   = element_text(angle = 30, hjust = 1),
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(
+    x        = NULL,
+    y        = "Serious Reaction Rate",
+    title    = "How Serious Are the Reactions? Rate of Serious Outcomes by Age",
+    subtitle = "Reports with unknown age excluded; n shown per bar"
+  )
+```
+
+Infants (0–2) stand out with the highest serious reaction rate at 90.3%, despite being among the least-reported groups (only 3,101 reports). This almost certainly reflects a **reporting bias** rather than a biological vulnerability unique to infants — adverse events in babies are considered alarming enough to document regardless, while milder events in the same age group go unreported. Children (3–12) show the lowest serious rate at 67.8%, suggesting that when reactions are reported for school-age children, they are more evenly spread across mild and severe. Among adults, rates are fairly stable (72–81%), with a gradual increase into the elderly.
+
+##### How the Nature of Harm Changes with Age
+
+Knowing that the elderly have an 81% serious reaction rate still masks an important question: what *kind* of harm are they experiencing? The grouped bar chart below separates fatal, hospitalization, life-threatening, and disability rates by age group.
+
+```{r age-outcome-grouped, fig.height = 6.5}
+data %>%
+  filter(age_group %in% age_order_known) %>%
+  group_by(age_group) %>%
+  summarise(
+    Fatal              = mean(is_fatal),
+    Hospitalized       = mean(is_hospitalized),
+    `Life-Threatening` = mean(is_life_threat),
+    Disabling          = mean(is_disabling)
+  ) %>%
+  pivot_longer(-age_group, names_to = "Outcome", values_to = "Rate") %>%
+  mutate(
+    age_group = factor(age_group, levels = age_order_known),
+    Outcome   = factor(Outcome,
+                       levels = c("Hospitalized", "Fatal",
+                                  "Life-Threatening", "Disabling"))
+  ) %>%
+  ggplot(aes(x = age_group, y = Rate, fill = Outcome)) +
+  geom_col(position = "dodge", width = 0.78) +
+  geom_text(
+    aes(label = percent(Rate, accuracy = 0.1)),
+    position = position_dodge(width = 0.78),
+    vjust = -0.35, size = 2.8, color = "grey25"
+  ) +
+  scale_fill_manual(values = c(
+    "Hospitalized"     = "#42A5F5",
+    "Fatal"            = "#4A148C",
+    "Life-Threatening" = "#EF5350",
+    "Disabling"        = "#FFA726"
+  )) +
+  scale_y_continuous(labels = percent, expand = expansion(mult = c(0, 0.14))) +
+  theme_minimal(base_size = 12) +
+  theme(
+    plot.title      = element_text(face = "bold", size = 14),
+    plot.subtitle   = element_text(color = "grey40", size = 11),
+    axis.text.x     = element_text(angle = 30, hjust = 1),
+    panel.grid.major.x = element_blank(),
+    legend.position = "bottom"
+  ) +
+  labs(
+    x        = NULL,
+    y        = "Rate Within Age Group",
+    fill     = NULL,
+    title    = "The Nature of Harm Shifts Dramatically with Age",
+    subtitle = "Fatal and hospitalization rates dominate in older patients; life-threatening reactions peak in infants"
+  )
+```
+
+This chart tells a different story depending on where you look. For **infants**, life-threatening reactions are the defining characteristic (11.4%), a rate three times higher than any adult age group — these tend to be systemic or allergic reactions with rapid onset. For **elderly patients (81+)**, it is fatality that stands out: 25.2% of reports in this group end in death, compared to just 6.6% in adults aged 19–40. Hospitalization also peaks in the elderly at 52.5%. The consistency of disability rates across all groups (roughly 2–3%) suggests that permanent impairment is more tied to the specific drug involved than to patient age.
+
+#### Weight
+
+
+##### Weight
+
+```{r weight-violin, fig.height = 5.5}
+data %>%
+  filter(!is.na(patient_weight_kg),
+         patient_weight_kg > 5,
+         patient_weight_kg < 250) %>%
+  ggplot(aes(x = serious, y = patient_weight_kg, fill = serious)) +
+  geom_violin(alpha = 0.55, trim = TRUE, adjust = 1.8, show.legend = FALSE) +
+  geom_boxplot(width = 0.1, outlier.shape = NA, fill = "white",
+               color = "grey30", show.legend = FALSE) +
+  stat_summary(fun = median, geom = "point", size = 3,
+               color = "grey20", show.legend = FALSE) +
+  scale_fill_manual(values = c("No" = "#4DBBD5", "Yes" = "#E64B35")) +
+  scale_x_discrete(labels = c("No" = "Non-Serious", "Yes" = "Serious")) +
+  scale_y_continuous(breaks = seq(0, 250, 25)) +
+  coord_cartesian(ylim = c(10, 200)) +
+  theme_minimal(base_size = 13) +
+  theme(
+    plot.title    = element_text(face = "bold", size = 14),
+    plot.subtitle = element_text(color = "grey40", size = 11),
+    panel.grid.major.x = element_blank()
+  ) +
+  labs(
+    x        = NULL,
+    y        = "Patient Weight (kg)",
+    title    = "Weight Is Not a Meaningful Differentiator of Reaction Severity",
+    subtitle = paste0("145,953 reports with recorded weight; values >200 kg trimmed for display\n",
+                      "Median: Serious = 72.6 kg | Non-Serious = 74.8 kg")
+  )
+```
+
+The distributions of patient weight for serious and non-serious reactions are almost identical — the median weights are 72.6 kg and 74.8 kg respectively, a difference of 2.2 kg. The violin shapes, IQRs, and upper tails all overlap. This tells us that weight on its own carries essentially no information about whether a reaction will be serious. This is unsurprising: weight is a proxy for body composition, but the mechanisms driving serious drug reactions — pharmacogenomics, polypharmacy, drug class — operate largely independently of body size. Weight may still appear in a LASSO model as a weak confounder, but it is unlikely to be selected as a primary predictor. It is also worth noting that weight is missing for 72% of reports, which further limits its role.
+
+### Neural Network Support
+
+### Training Diagnostics
+
+The training curves show how each model learned over time. A good pattern is when training and validation loss both decrease and then level off. If training loss keeps improving while validation loss gets worse, that would suggest overfitting.
+
+```{r nn_training_diagnostics, fig.height=6.4, fig.width=11}
+history_all <- bind_rows(
+  history_to_data_frame(history_baseline, "Baseline shallow neural network"),
+  history_to_data_frame(history_deep, "Deep dense neural network"),
+  history_to_data_frame(history_wide_deep, "Wide and deep neural network")
+)
+
+loss_data <- history_all %>%
+  select(Model, Epoch, Training_Loss, Validation_Loss) %>%
+  pivot_longer(
+    cols = c(Training_Loss, Validation_Loss),
+    names_to = "Series",
+    values_to = "Loss"
+  ) %>%
+  mutate(Series = recode(Series,
+                         Training_Loss = "Training loss",
+                         Validation_Loss = "Validation loss"))
+
+accuracy_data <- history_all %>%
+  select(Model, Epoch, Training_Accuracy, Validation_Accuracy) %>%
+  pivot_longer(
+    cols = c(Training_Accuracy, Validation_Accuracy),
+    names_to = "Series",
+    values_to = "Accuracy"
+  ) %>%
+  mutate(Series = recode(Series,
+                         Training_Accuracy = "Training accuracy",
+                         Validation_Accuracy = "Validation accuracy"))
+
+loss_plot <- ggplot(loss_data, aes(x = Epoch, y = Loss, color = Series)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ Model, scales = "free_y") +
+  scale_color_brewer(palette = "Dark2") +
+  theme(legend.title = element_blank()) +
+  labs(
+    title = "Training and Validation Loss",
+    x = "Epoch",
+    y = "Binary cross entropy loss"
+  )
+
+accuracy_plot <- ggplot(accuracy_data, aes(x = Epoch, y = Accuracy, color = Series)) +
+  geom_line(linewidth = 0.9) +
+  facet_wrap(~ Model) +
+  scale_y_continuous(labels = percent_format(accuracy = 1)) +
+  scale_color_brewer(palette = "Dark2") +
+  theme(legend.title = element_blank()) +
+  labs(
+    title = "Training and Validation Accuracy",
+    x = "Epoch",
+    y = "Accuracy"
+  )
+
+gridExtra::grid.arrange(loss_plot, accuracy_plot, ncol = 1)
+```
+
+
+### Boosted Model Support
+
+#### With Country 
+
+```{r}
+
+# remove columns related to outcome (except serious)
+data_train_subset <- data_train %>% dplyr::select(year, month, serious, num_reactions, num_drugs, suspect_drug, brand_name, drug_indication, pharm_class, drug_count_category, patient_age_years, patient_sex, patient_weight_kg, country)
+
+data_test_subset <- data_test %>% dplyr::select(year, month, serious, num_reactions, num_drugs, suspect_drug, brand_name, drug_indication, pharm_class, drug_count_category, patient_age_years, patient_sex, patient_weight_kg, country)
+
+# build DMatrices
+
+options(na.action = "na.pass")
+
+# train
+X_train <- sparse.model.matrix(serious ~ . - 1, data = data_train_subset)
+labels <- as.numeric(data_train_subset$serious) - 1
+nrow(X_train) == length(labels)
+
+dtrain <- xgb.DMatrix(data = X_train, label = labels, missing = NA)
+
+# test
+X_test <- sparse.model.matrix(serious ~ . - 1, data = data_test_subset)
+labels_test <- as.numeric(data_test_subset$serious) - 1
+nrow(X_test) == length(labels_test)
+
+dtest <- xgb.DMatrix(data = X_test, label = labels_test, missing = NA)
+
+```
+
+#### Boosted Fit 1: Including Country
+
+We first build a naive fit and display the ROC Curve below. For this model, we used year, month, number of reported reactions, number of drugs taken by patient, suspected drug, brand name, condition the medication was prescribed for, FDA pharmaceutical class, polypharmacy bin, and patient demographics (age, sex, weight, and country of reaction). We chose to include each of these predictors to better capture nuanced relationships within the data and to potentially find interacting effects. For the naive fit, we report an AUC of 0.927.
+
+```{r boosted fit}
+
+# hyperparameters
+# we start by using AUC criterion
+# and binary:logistic to predict outcome (serious/not serious)
+
+set.seed(1)
+
+params <- list(
+  booster = "gbtree",
+  eta = 0.01, # was 0.1
+  max_depth = 4, # was 3
+  subsample = 0.5,
+  gamma = 1,
+  lambda = 0, # was 1
+  colsample_bytree = 0.8,
+  min_child_weight = 5,
+  objective = "binary:logistic",
+  eval_metric = "auc"
+)
+
+# build first (naive) fit
+xgb.fit <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 500,
+  verbose = 0,
+  evals = list(train = dtrain, test = dtest)
+)
+
+# classifier
+pred_prob <- predict(xgb.fit, dtest)
+pred_class <- ifelse(pred_prob > 0.5, 1, 0)
+mean(pred_class == (as.numeric(data_test_subset$serious) - 1)) # that's pretty good!! - 0.852
+
+# roc curve
+roc_boost <- roc(data_test_subset$serious, pred_prob)
+plot(roc_boost, 
+     main = "ROC Curve for Naive Boosted Model 1 (Including Country)",
+     col = "blue",
+     lwd = 2,
+     print.auc = TRUE)
+
+
+```
+
+```{r}
+
+set.seed(1)
+
+# define hyperparameters
+params <- list(
+  booster = "gbtree",
+  objective = "binary:logistic",
+  eval_metric = "auc",
+  eta = 0.1,
+  max_depth = 6,
+  min_child_weight = 1, 
+  gamma = 0,            
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  scale_pos_weight = sum(labels == 0) / sum(labels == 1)
+)
+
+# cross validation
+#cv <- xgb.cv(
+#  params = params,
+#  data = dtrain,
+#  nrounds = 1000,
+#  nfold = 5,
+#  stratified = TRUE,
+#  early_stopping_rounds = 20,
+#  maximize = TRUE
+#)
+
+```
+
+Using fct_lump can remove rare but deadly reactions, since we are now only considering the 50 most common factor variables. These can be explored with EDA and are left out of the modeling process. It means that the model might not perform well when seeing these rarer drugs, but the model performs very well on more common medications.
+
+Cross validation showed a **high training and testing AUC**, with the training AUC flattening around **0.94** and the testing AUC flattening around **0.929** after **1000 rounds**. Cross validation did not yield a best iteration as the AUC continued to increase, even after 1000 rounds, though the practical improvements bottomed out around **500 rounds**, with training AUC of 0.93 and testing AUC of 0.925. For computational efficiency, we proceed with the 500-round model, reporting the most important features and ROC curve below.
+
+```{r}
+
+set.seed(1)
+
+# final model
+final_xgb <- xgb.train(
+  params = params,
+  data = dtrain,
+  nrounds = 500
+)
+
+# classifier
+pred_prob_final <- predict(final_xgb, dtest)
+pred_class_final <- ifelse(pred_prob_final > 0.5, 1, 0)
+mean(pred_class_final == (as.numeric(data_test_subset$serious) - 1)) # 0.825
+
+# roc curve
+roc_boost_final <- roc(data_test_subset$serious, pred_prob_final)
+plot(roc_boost_final, 
+     main = "ROC Curve for Final Boosted Model 1 (Including Country)", 
+     col = "blue", 
+     lwd = 2, 
+     print.auc = TRUE) 
+
+# confusion matrix
+pred_class_final <- factor(pred_class_final, levels = c(0,1), labels = c("No", "Yes"))
+
+# PLOT heatmap of confusion matrix
+ggplot(as.data.frame(confusionMatrix(pred_class_final, data_test_subset$serious)$table), aes(Reference, Prediction, fill = Freq)) +
+  geom_tile() +
+  geom_text(aes(label = Freq), color = "white") +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(title = "Confusion Matrix for Boosted Fit 1")
+
+
+
+```
+
+```{r, results = TRUE}
+# important predictors
+importance <- xgb.importance(model = final_xgb)
+knitr::kable(head(importance, 15),
+             caption = "Most Important Features in Boosted Model") %>% kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+# plot a representative tree (first one)
+# xgb.plot.tree(model = final_xgb, trees = 0)
+
+# convert tree to table
+# shows us which features the model splits on first
+first_tree <- xgb.model.dt.tree(model = final_xgb)
+
+```
+
+The single split on whether the report came from the United States accounts for nearly **43\%** of the total information the model uses to make its decisions, which is vastly larger than all other predictor variables. This might be because this is a FDA managed data set, which is an American authority and is likely biased towards drug interactions that occurred in the US.
+
+```{r}
+plot_data <- data %>%
+  count(country) %>%
+  mutate(
+    pct = n / sum(n) * 100,
+    country = reorder(country, -n)
+  ) %>%
+  arrange(desc(n)) %>%
+  slice(1:20) %>% 
+  mutate(country = reorder(country, -n))
+
+ggplot(plot_data, aes(x = country, y = n, fill = country)) +
+  geom_bar(stat = "identity", color = "white", linewidth = 0.1) +
+  scale_fill_manual(values = rainbow(nrow(plot_data))) +
+  scale_y_continuous(labels = comma) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Global Distribution of Reports by Country",
+    subtitle = paste0("Total Sample Size: ", comma(sum(plot_data$n)), " reports"),
+    x = "Country (Top 20 + Other)",
+    y = "Number of Reports",
+    caption = "Data from the FDA Adverse Drug Effects Database"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 9),
+    legend.position = "none", 
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold", size = 18, color = "#2c3e50"),
+    plot.subtitle = element_text(size = 12, color = "#7f8c8d")
+  )
+```
+
+```{r, results = TRUE}
+# rate of serious reaction by country
+data %>%
+  group_by(country) %>%
+  summarise(
+    total = n(),
+    serious_rate = mean(as.numeric(as.factor(serious)) - 1)
+  ) %>%
+  arrange(desc(total)) %>%
+  slice(1:5) %>%
+  knitr::kable(caption = 'Rate of Serious Reaction, by Country',
+               col.names = c("Country", "Count", "Rate of Serious Reaction")) %>%
+  kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+```
+
+Not only does the US account for the majority of the entries in the database, but the other most common countries have a **much higher** rate of serious reactions. This may be because only serious reactions to drugs are reported while abroad, whereas any drug interaction is reported domestically.
+
+```{r, results = T}
+# table for other metrics
+
+knitr::kable(confusionMatrix(pred_class_final, data_test_subset$serious)$byClass,
+             caption = 'Success Metrics for Boosted Fit 1',
+             col.names = c('Metric', 'Value')) %>%
+  kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+# features model splits on
+knitr::kable(first_tree[1:7, .(ID, Feature, Split, Yes, No, Gain)],
+             caption = "Features the Final Boosted Model (with country) Splits on", 
+             col.names = c("ID", "Feature", "Split", "Yes", "No", "Gain")) %>%
+  kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+```
+
+#### Without Country (Naive Model)
+
+```{r, results = T}
+# important predictors
+importance2 <- xgb.importance(model = xgb.fit2)
+knitr::kable(head(importance2, 15),
+             caption = "Most Important Features in Boosted Model, without Country") %>% kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+# plot a representative tree (first one)
+ xgb.plot.tree(model = xgb.fit2, trees = 0)
+```
+
+#### Without Country (Validated Model)
+
+```{r, results = T}
+first_tree2 <- xgb.model.dt.tree(model = final_xgb_2)
+knitr::kable(first_tree2[1:7, .(ID, Feature, Split, Yes, No, Gain)], 
+             caption = 'Ordered Features that Boosted Model (no country) Splits on') %>% kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+# confusionMatrix(pred_class_final2, data2_test$serious)
+
+# success metrics from confusion matrix
+knitr::kable(confusionMatrix(pred_class_final2, data2_test$serious)$byClass,
+             caption = 'Success Metrics for Boosted Fit 2',
+             col.names = c('Metric', 'Value')) %>%
+  kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+```
+
+
+```{r, results = T}
+# number of reactions
+data %>%
+  group_by(num_reactions) %>%
+  summarise(
+    total = n(),
+    serious_rate = mean(as.numeric(as.factor(serious)) - 1)
+  ) %>%
+  slice_tail(n = 10) %>%
+  arrange(desc(total)) %>%
+  knitr::kable(col.names = c("Number of Reactions Reported", "Count", "Rate of Serious Reaction"),
+               caption = "Rate of Serious Reaction Outcomes by Number of Reported Reactions")
+
+# number of drugs taken
+data %>%
+  group_by(num_drugs) %>%
+  summarise(
+    total = n(),
+    serious_rate = mean(as.numeric(as.factor(serious)) - 1)
+  ) %>%
+  slice_tail(n = 10) %>%
+  arrange(desc(total)) %>%
+  knitr::kable(col.names = c("Number of Drugs Taken", "Count", "Rate of Serious Reaction"),
+               caption = "Rate of Serious Reaction Outcomes by Number of Drugs Taken by Patient") %>% kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+```
+
+#### EDA For Boosted Model
+
+
+```{r}
+data %>%
+  count(num_reactions) %>%
+  mutate(
+    pct = n / sum(n) * 100,
+    num_reactions = reorder(num_reactions, -n)
+  ) %>%
+  arrange(desc(n)) %>%
+  slice(1:20) %>% 
+  mutate(num_reactions = reorder(num_reactions, -n)) %>%
+  ggplot(aes(x = num_reactions, y = n, fill = num_reactions)) +
+  geom_bar(stat = "identity", color = "white", linewidth = 0.1) +
+  scale_fill_manual(values = rainbow(20)) +
+  scale_y_continuous(labels = comma) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Distribution of Reports by Number of Reactions Reported",
+    subtitle = paste0("Total Sample Size: ", comma(sum(plot_data$n)), " reports"),
+    x = "Number of Reactions (Top 20)" ,
+    y = "Number of Reports",
+    caption = "Data from the FDA Adverse Drug Effects Database"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 9),
+    legend.position = "none", 
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold", size = 18, color = "#2c3e50"),
+    plot.subtitle = element_text(size = 12, color = "#7f8c8d")
+  )
+
+```
+
+```{r}
+data %>%
+  count(num_drugs) %>%
+  mutate(
+    pct = n / sum(n) * 100,
+    num_drugs = reorder(num_drugs, -n)
+  ) %>%
+  arrange(desc(n)) %>%
+  slice(1:20) %>% 
+  mutate(num_drugs = reorder(num_drugs, -n)) %>%
+  ggplot(aes(x = num_drugs, y = n, fill = num_drugs)) +
+  geom_bar(stat = "identity", color = "white", linewidth = 0.1) +
+  scale_fill_manual(values = rainbow(20)) +
+  scale_y_continuous(labels = comma) +
+  theme_minimal(base_size = 14) +
+  labs(
+    title = "Distribution of Reports by Number of Drugs Taken by Patient",
+    subtitle = paste0("Total Sample Size: ", comma(sum(plot_data$n)), " reports"),
+    x = "Number of Drugs Taken (Top 20)" ,
+    y = "Number of Reports",
+    caption = "Data from the FDA Adverse Drug Effects Database"
+  ) +
+  theme(
+    axis.text.x = element_text(angle = 45, vjust = 1, hjust = 1, size = 9),
+    legend.position = "none", 
+    panel.grid.major.x = element_blank(),
+    plot.title = element_text(face = "bold", size = 18, color = "#2c3e50"),
+    plot.subtitle = element_text(size = 12, color = "#7f8c8d")
+  )
+
+```
+
+
+
+```{r, results = T}
+# number of reactions
+data %>%
+  group_by(num_reactions) %>%
+  summarise(
+    total = n(),
+    serious_rate = mean(as.numeric(as.factor(serious)) - 1)
+  ) %>%
+  slice(1:15) %>%
+  arrange(desc(total)) %>%
+  knitr::kable(col.names = c("Number of Reactions Reported", "Count", "Rate of Serious Reaction"),
+               caption = "Rate of Serious Reaction Outcomes by Number of Reported Reactions") %>% kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+# number of drugs taken
+data %>%
+  group_by(num_drugs) %>%
+  summarise(
+    total = n(),
+    serious_rate = mean(as.numeric(as.factor(serious)) - 1)
+  ) %>%
+  slice(1:15) %>%
+  arrange(desc(total)) %>%
+  knitr::kable(col.names = c("Number of Drugs Taken", "Count", "Rate of Serious Reaction"),
+               caption = "Rate of Serious Reaction Outcomes by Number of Drugs Taken by Patient") %>% kable_styling(bootstrap_options = "condensed", full_width = FALSE)
+
+```
+
+## AI Usage Statement
+
+- **Debugging and Code Correction:** Claude and ChatGPT was used to identify and fix errors in the R Markdown file throughout the project. This included resolving variable scoping issues in the XGBoost modeling sections (e.g., params object defined out of order), correcting misassigned variable names in the neural network model loading blocks, and fixing incorrect data frame references in confusion matrix calls.
+
+- **Methods Section Drafting:** Claude and ChatGPT was used to help draft the Methods section of this report, drawing on the modeling code already written by the authors and the project slide deck. The statistical descriptions, mathematical notation, and justifications were reviewed and approved by the authors before inclusion.
+
+- **Scope of AI Use:** Claude and ChatGPT was not used to perform any data analysis, make modeling decisions, interpret results, or generate any of the figures, tables, or code in this report. All analytical choices, including model selection, hyperparameter tuning, predictor inclusion decisions, and conclusions drawn from results, are the original work of Suzanna Semaan, Olivia Yang, and Kruthi Muralidhara Jety.
+
