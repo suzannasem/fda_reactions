@@ -1,1 +1,7 @@
-# fda_reactions
+#  Investigating Adverse Reactions to Prescription Medications with Penalized Logistic Regression, Neural Networks, and Extreme Gradient Boosting
+
+We seek to understand what factors can be used to predict serious drug outcomes. The data set we use is a collection of drug safety reports submitted by healthcare professionals, manufacturers, and patients to the FDA Adverse Event Reporting System (FAERS), containing 528,000 reports between January 2015 and December 2025. We use logistic regression with LASSO to determine the most significant predictors for a serious disease outcome. We also fit neural network-based models and an extreme gradient boosting model (XGBoost) to better capture nuanced relationships in the data and to robustly handle missing information. The overall best model for prediction, as determined by AUC, interpretability, and accuracy, is the **logistic LASSO model**. The LASSO model has higher interpretability and is less prone to overfitting than neural network and boosted models, but lacks classification ability, likely due to imbalanced data split. We recommend the **boosted model** for classification since it has the highest AUC and a relatively balanced sensitivity and specificity, meaning it is not over-predicting serious reactions.
+
+**Data used in this project can be found on [Kaggle](https://www.kaggle.com/datasets/kanchana1990/fda-drug-adverse-event-reports-2015-to-2026-faers). FDA_model_analysis.Rmd contains all code needed to replicate results, while FDA_model_analysis.html is a knitted version better for reading.**
+
+This project was submitted as a final assignment for STAT 4710 at UPenn in Spring 2026 and is the work of Suzanna Semaan, Olivia Yang, and Kruthi Muralidhara Jety.
